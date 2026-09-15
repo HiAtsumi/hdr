@@ -1,6 +1,6 @@
 {
-    "name": "hdr",
-    "short_name": "hdr",
+    "name": "HDRconverter",
+    "short_name": "HDRconverter",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

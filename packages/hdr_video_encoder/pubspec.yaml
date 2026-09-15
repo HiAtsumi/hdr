@@ -1,0 +1,31 @@
+name: hdr_video_encoder
+description: >
+  Encodes raw sRGB RGBA frames to an HDR HEVC Main10 mp4 (PQ or HLG) via
+  native encoders (AVAssetWriter on iOS/macOS, MediaCodec on Android),
+  applying a per-pixel whiteness-driven glow and, for PQ, static HDR10
+  metadata (Mastering Display Color Volume / Content Light Level). The SDR
+  export path still uses flutter_quick_video_encoder. Vendored copy — keep in
+  sync with the lyrics repo.
+version: 0.1.0
+publish_to: 'none'
+
+environment:
+  sdk: ^3.10.7
+  flutter: '>=3.19.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      ios:
+        pluginClass: HdrVideoEncoderPlugin
+        sharedDarwinSource: true
+      macos:
+        pluginClass: HdrVideoEncoderPlugin
+        sharedDarwinSource: true
+      android:
+        package: com.eonlineservice.hdr_video_encoder
+        pluginClass: HdrVideoEncoderPlugin

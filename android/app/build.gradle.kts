@@ -47,3 +47,9 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // HDRプレビュー用Platform View(HdrVideoPlayerView)がExoPlayerを直接使うため明示的に依存させる。
+    // video_player_androidが内部で使うバージョンに合わせている。
+    implementation("androidx.media3:media3-exoplayer:1.8.0")
+}

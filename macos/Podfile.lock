@@ -1,0 +1,56 @@
+PODS:
+  - file_selector_macos (0.0.1):
+    - FlutterMacOS
+  - FlutterMacOS (1.0.0)
+  - hdr_converter (0.1.0):
+    - Flutter
+    - FlutterMacOS
+  - hdr_video_encoder (0.1.0):
+    - Flutter
+    - FlutterMacOS
+  - share_plus (0.0.1):
+    - FlutterMacOS
+  - video_player_avfoundation (0.0.1):
+    - Flutter
+    - FlutterMacOS
+  - webview_flutter_wkwebview (0.0.1):
+    - Flutter
+    - FlutterMacOS
+
+DEPENDENCIES:
+  - file_selector_macos (from `Flutter/ephemeral/.symlinks/plugins/file_selector_macos/macos`)
+  - FlutterMacOS (from `Flutter/ephemeral`)
+  - hdr_converter (from `Flutter/ephemeral/.symlinks/plugins/hdr_converter/darwin`)
+  - hdr_video_encoder (from `Flutter/ephemeral/.symlinks/plugins/hdr_video_encoder/darwin`)
+  - share_plus (from `Flutter/ephemeral/.symlinks/plugins/share_plus/macos`)
+  - video_player_avfoundation (from `Flutter/ephemeral/.symlinks/plugins/video_player_avfoundation/darwin`)
+  - webview_flutter_wkwebview (from `Flutter/ephemeral/.symlinks/plugins/webview_flutter_wkwebview/darwin`)
+
+EXTERNAL SOURCES:
+  file_selector_macos:
+    :path: Flutter/ephemeral/.symlinks/plugins/file_selector_macos/macos
+  FlutterMacOS:
+    :path: Flutter/ephemeral
+  hdr_converter:
+    :path: Flutter/ephemeral/.symlinks/plugins/hdr_converter/darwin
+  hdr_video_encoder:
+    :path: Flutter/ephemeral/.symlinks/plugins/hdr_video_encoder/darwin
+  share_plus:
+    :path: Flutter/ephemeral/.symlinks/plugins/share_plus/macos
+  video_player_avfoundation:
+    :path: Flutter/ephemeral/.symlinks/plugins/video_player_avfoundation/darwin
+  webview_flutter_wkwebview:
+    :path: Flutter/ephemeral/.symlinks/plugins/webview_flutter_wkwebview/darwin
+
+SPEC CHECKSUMS:
+  file_selector_macos: 3e56eaea051180007b900eacb006686fd54da150
+  FlutterMacOS: c232990155153907050900a2e175c7773903ba4e
+  hdr_converter: ee6b8487dadad0496dcf4c983190d0076049bb2f
+  hdr_video_encoder: 91dde7aaec66d19d065551672acc0e5ee7158e0e
+  share_plus: 1fa619de8392a4398bfaf176d441853922614e89
+  video_player_avfoundation: e54d03b3b19f64f2c557354f72ce538387541ba6
+  webview_flutter_wkwebview: 29eb20d43355b48fe7d07113835b9128f84e3af4
+
+PODFILE CHECKSUM: 1e95c36afbfd1cb6423ceca4de7a8e1b256fb6ac
+
+COCOAPODS: 1.16.2

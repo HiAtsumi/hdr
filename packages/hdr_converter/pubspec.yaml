@@ -1,0 +1,29 @@
+name: hdr_converter
+description: >
+  Decodes an SDR video into per-frame sRGB RGBA8888 buffers (for feeding into
+  hdr_video_encoder) and converts a single SDR image into a native HDR still
+  image (HEIC/HLG on iOS & macOS, Ultra HDR JPEG on Android). Uses the same
+  per-pixel colour science as hdr_video_encoder — keep the two in sync.
+version: 0.1.0
+publish_to: 'none'
+
+environment:
+  sdk: ^3.10.7
+  flutter: '>=3.19.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      ios:
+        pluginClass: HdrConverterPlugin
+        sharedDarwinSource: true
+      macos:
+        pluginClass: HdrConverterPlugin
+        sharedDarwinSource: true
+      android:
+        package: com.eonlineservice.hdr_converter
+        pluginClass: HdrConverterPlugin

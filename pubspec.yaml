@@ -34,6 +34,21 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
+  image_picker: ^1.2.3
+  path_provider: ^2.1.6
+  path: ^1.9.1
+  share_plus: ^13.3.0
+  video_player: ^2.14.0
+  hdr_video_encoder:
+    path: packages/hdr_video_encoder
+  hdr_converter:
+    path: packages/hdr_converter
+  flutter_localizations:
+    sdk: flutter
+  # Pinned: 9.1.0 pulls in Google-Mobile-Ads-SDK 13.9.0, which fails to build
+  # on iOS ("non-modular header" in a private beta header). 9.0.0 resolves to
+  # 13.3.0, which builds fine (same version the sister app videoconnect uses).
+  google_mobile_ads: 9.0.0
 
 dev_dependencies:
   flutter_test:

@@ -4,14 +4,17 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 
-bool get isAdsSupportedPlatform => !kIsWeb && (Platform.isIOS || Platform.isAndroid);
+bool get isAdsSupportedPlatform =>
+    !kIsWeb && (Platform.isIOS || Platform.isAndroid);
 
-// Google公式のテスト用バナー広告ユニットID。実IDが決まり次第差し替える。
+// Google公式のバナー広告ユニットID。上がテスト用、下が実ID。
 // https://developers.google.com/admob/android/test-ads
 // https://developers.google.com/admob/ios/test-ads
-String get _testBannerAdUnitId => Platform.isIOS
-    ? 'ca-app-pub-3940256099942544/2934735716'
-    : 'ca-app-pub-3940256099942544/6300978111';
+String get _testBannerAdUnitId => Platform.isAndroid
+    //? 'ca-app-pub-3940256099942544/6300978111'
+    ? 'ca-app-pub-3974776018579904/2387971054'
+    //: 'ca-app-pub-3940256099942544/2934735716';
+    : 'ca-app-pub-3974776018579904/6462947431';
 
 /// Anchored adaptive banner, meant to sit as the last child of a bottom-
 /// aligned Column on every screen. Renders nothing while loading, on

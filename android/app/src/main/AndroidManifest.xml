@@ -30,11 +30,11 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
-        <!-- Google公式のテスト用AdMob App ID。実IDが決まり次第差し替える。
+        <!-- 実IDが決まったので差し替えた。
              https://developers.google.com/admob/android/test-ads -->
         <meta-data
             android:name="com.google.android.gms.ads.APPLICATION_ID"
-            android:value="ca-app-pub-3940256099942544~3347511713" />
+            android:value="ca-app-pub-3974776018579904~4078036256" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

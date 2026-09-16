@@ -13,8 +13,8 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 
-// AdBannerは一旦非表示中(下のbuild()内コメント参照)。
-// import 'ad_banner.dart';
+import 'ad_banner.dart';
+import 'ad_interstitial.dart';
 import 'hdr_image_view.dart';
 import 'hdr_video_player.dart';
 import 'native_view_zoom.dart';
@@ -96,9 +96,12 @@ class _ConvertPageState extends State<ConvertPage> {
   static const _clickChannel = MethodChannel('com.eonlineservice.hdr/click_sound');
   AudioPool? _clickPool;
 
+  final _interstitialAd = InterstitialAdController();
+
   @override
   void initState() {
     super.initState();
+    _interstitialAd.preload();
     if (!Platform.isIOS) {
       AudioPool.createFromAsset(
         path: 'sounds/click.wav',
@@ -119,6 +122,7 @@ class _ConvertPageState extends State<ConvertPage> {
     _sourcePreview?.dispose();
     _resultPlayer?.dispose();
     _clickPool?.dispose();
+    _interstitialAd.dispose();
     for (final image in _previewImageHistory) {
       image.dispose();
     }
@@ -193,6 +197,9 @@ class _ConvertPageState extends State<ConvertPage> {
 
   Future<void> _convert() async {
     _playClickSound();
+    // 変換処理はここで待たず並行して進める。広告を閉じるまで変換が止まって
+    // 見えないよう、裏で変換を継続させる。
+    _interstitialAd.showIfReady();
     if (_kind == _Kind.image) {
       await _convertImage();
     } else if (_kind == _Kind.video) {
@@ -842,7 +849,7 @@ class _ConvertPageState extends State<ConvertPage> {
               ),
             ),
           ),
-          // 一旦非表示。復活させる場合はこのコメントを外す: const AdBanner(),
+          const AdBanner(),
         ],
       ),
     );

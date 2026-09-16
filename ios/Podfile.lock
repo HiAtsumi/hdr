@@ -1,4 +1,7 @@
 PODS:
+  - audioplayers_darwin (0.0.1):
+    - Flutter
+    - FlutterMacOS
   - Flutter (1.0.0)
   - Google-Mobile-Ads-SDK (13.3.0):
     - GoogleUserMessagingPlatform (>= 1.1)
@@ -27,6 +30,7 @@ PODS:
     - FlutterMacOS
 
 DEPENDENCIES:
+  - audioplayers_darwin (from `.symlinks/plugins/audioplayers_darwin/darwin`)
   - Flutter (from `Flutter`)
   - google_mobile_ads (from `.symlinks/plugins/google_mobile_ads/ios`)
   - hdr_converter (from `.symlinks/plugins/hdr_converter/darwin`)
@@ -43,6 +47,8 @@ SPEC REPOS:
     - GoogleUserMessagingPlatform
 
 EXTERNAL SOURCES:
+  audioplayers_darwin:
+    :path: ".symlinks/plugins/audioplayers_darwin/darwin"
   Flutter:
     :path: Flutter
   google_mobile_ads:
@@ -63,6 +69,7 @@ EXTERNAL SOURCES:
     :path: ".symlinks/plugins/webview_flutter_wkwebview/darwin"
 
 SPEC CHECKSUMS:
+  audioplayers_darwin: f15e209a3e856d1a7edcf98dc029f484fead2242
   Flutter: 71a624a5bc0c04062bf19101d501e466baf2fb47
   Google-Mobile-Ads-SDK: 7692126a35ed859f20635af281c50a2162be8bea
   google_mobile_ads: e0c300fcd472c3fa5a00d6cca8b0c65bbbb15faf

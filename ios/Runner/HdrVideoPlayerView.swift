@@ -49,9 +49,14 @@ private final class HdrPlayerContainerView: UIView {
 class HdrVideoPlayerView: NSObject, FlutterPlatformView {
   private let containerView: HdrPlayerContainerView
   private var player: AVQueuePlayer?
-  private var looper: AVPlayerLooper?
   private let channel: FlutterMethodChannel
   private var presentationSizeObservation: NSKeyValueObservation?
+  private var itemDidEndObserver: NSObjectProtocol?
+  // SNSアプリへ切り替える(共有シートを開く)などでバックグラウンドへ回ると、
+  // システムがAVPlayerLayerの再生を強制停止し、表示中だったデコード済み
+  // フレームも解放する。フォアグラウンド復帰時に自前で再生を再開しないと、
+  // 再生済みフレームが無いままレイヤーが真っ黒に固定されてしまう。
+  private var shouldBePlaying = false
 
   init(
     frame: CGRect,
@@ -79,12 +84,26 @@ class HdrVideoPlayerView: NSObject, FlutterPlatformView {
       self?.handle(call, result: result)
     }
 
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(applicationDidBecomeActive),
+      name: UIApplication.didBecomeActiveNotification,
+      object: nil
+    )
+
     guard let params = args as? [String: Any], let path = params["path"] as? String else {
       return
     }
     let looping = params["looping"] as? Bool ?? false
     let autoplay = params["autoplay"] as? Bool ?? false
+    shouldBePlaying = autoplay
     setUpPlayer(path: path, looping: looping, autoplay: autoplay)
+  }
+
+  @objc private func applicationDidBecomeActive() {
+    if shouldBePlaying {
+      player?.play()
+    }
   }
 
   func view() -> UIView {
@@ -109,10 +128,28 @@ class HdrVideoPlayerView: NSObject, FlutterPlatformView {
     }
 
     if looping {
-      // ループ再生はAVPlayerLooperにまかせ、フレーム落ちのない切り替えにする。
-      looper = AVPlayerLooper(player: queuePlayer, templateItem: item)
-    } else {
-      queuePlayer.insert(item, after: nil)
+      // AVQueuePlayer's default .advance behaviour removes an item from the
+      // queue once it finishes — with only one item, that leaves currentItem
+      // nil, so a later seek(to:)/play() on the player has nothing to act
+      // on. .none keeps the (now-paused) item in place so the loop below can
+      // rewind and replay it.
+      queuePlayer.actionAtItemEnd = .none
+    }
+    queuePlayer.insert(item, after: nil)
+
+    if looping {
+      // AVPlayerLooper produced a runaway timeControlStatus churn (repeatedly
+      // re-entering "playing" without visibly advancing) on some of our own
+      // encoded HDR outputs — a plain end-of-item notification restarting
+      // playback from zero is less clever but reliable for a single item.
+      itemDidEndObserver = NotificationCenter.default.addObserver(
+        forName: .AVPlayerItemDidPlayToEndTime,
+        object: item,
+        queue: .main
+      ) { [weak queuePlayer] _ in
+        queuePlayer?.seek(to: .zero)
+        queuePlayer?.play()
+      }
     }
 
     player = queuePlayer
@@ -124,13 +161,15 @@ class HdrVideoPlayerView: NSObject, FlutterPlatformView {
   private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "play":
+      shouldBePlaying = true
       player?.play()
       result(nil)
     case "pause":
+      shouldBePlaying = false
       player?.pause()
       result(nil)
     case "setLooping":
-      // AVPlayerLooperは生成時にのみ設定できるため、生成後の切り替えは未対応。
+      // ループはitemDidEndObserverで固定的に設定しているため、生成後の切り替えは未対応。
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
@@ -138,6 +177,10 @@ class HdrVideoPlayerView: NSObject, FlutterPlatformView {
   }
 
   deinit {
+    NotificationCenter.default.removeObserver(self)
+    if let itemDidEndObserver = itemDidEndObserver {
+      NotificationCenter.default.removeObserver(itemDidEndObserver)
+    }
     player?.pause()
     channel.setMethodCallHandler(nil)
   }

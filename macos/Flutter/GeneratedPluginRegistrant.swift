@@ -5,6 +5,7 @@
 import FlutterMacOS
 import Foundation
 
+import audioplayers_darwin
 import file_selector_macos
 import hdr_converter
 import hdr_video_encoder
@@ -14,6 +15,7 @@ import video_player_avfoundation
 import webview_flutter_wkwebview
 
 func RegisterGeneratedPlugins(registry: FlutterPluginRegistry) {
+  AudioplayersDarwinPlugin.register(with: registry.registrar(forPlugin: "AudioplayersDarwinPlugin"))
   FileSelectorPlugin.register(with: registry.registrar(forPlugin: "FileSelectorPlugin"))
   HdrConverterPlugin.register(with: registry.registrar(forPlugin: "HdrConverterPlugin"))
   HdrVideoEncoderPlugin.register(with: registry.registrar(forPlugin: "HdrVideoEncoderPlugin"))

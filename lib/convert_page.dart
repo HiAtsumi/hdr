@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show PlatformException;
 import 'package:hdr_converter/hdr_converter.dart';
@@ -79,10 +80,23 @@ class _ConvertPageState extends State<ConvertPage> {
   int _previewKey = 0;
   final List<ui.Image> _previewImageHistory = [];
 
+  // A soft custom tap sound for button presses — the platform's built-in
+  // SystemSoundType.click (a raw keyboard-click sample) reads as a harsh
+  // "pop" over a phone speaker, so we ship our own gentler effect instead.
+  final _clickPlayer = AudioPlayer(playerId: 'ui_click');
+
+  @override
+  void initState() {
+    super.initState();
+    _clickPlayer.setReleaseMode(ReleaseMode.stop);
+    _clickPlayer.setSource(AssetSource('sounds/click.wav'));
+  }
+
   @override
   void dispose() {
     _sourcePreview?.dispose();
     _resultPlayer?.dispose();
+    _clickPlayer.dispose();
     for (final image in _previewImageHistory) {
       image.dispose();
     }
@@ -94,7 +108,16 @@ class _ConvertPageState extends State<ConvertPage> {
     return _videoExtensions.contains(ext) ? _Kind.video : _Kind.image;
   }
 
+  // Rewinds and replays our bundled tap sound. seek+resume (rather than
+  // play(), which re-resolves the asset source each time) keeps repeated
+  // taps snappy.
+  void _playClickSound() {
+    _clickPlayer.seek(Duration.zero);
+    _clickPlayer.resume();
+  }
+
   Future<void> _pick() async {
+    _playClickSound();
     final picked = await ImagePicker().pickMedia();
     if (picked == null) return;
     if (_detectKind(picked.path) == _Kind.video) {
@@ -147,6 +170,7 @@ class _ConvertPageState extends State<ConvertPage> {
   }
 
   Future<void> _convert() async {
+    _playClickSound();
     if (_kind == _Kind.image) {
       await _convertImage();
     } else if (_kind == _Kind.video) {
@@ -218,6 +242,7 @@ class _ConvertPageState extends State<ConvertPage> {
   }
 
   void _cancelConversion() {
+    _playClickSound();
     setState(() => _cancelRequested = true);
     if (Platform.isIOS && _kind == _Kind.video) {
       // The Dart-side loop (used on other platforms) polls _cancelRequested
@@ -238,6 +263,12 @@ class _ConvertPageState extends State<ConvertPage> {
       return;
     }
 
+    // The live per-frame conversion preview (silent) takes over the screen
+    // once conversion starts, but this controller was never told to stop —
+    // it kept playing (and audible) behind the scenes for the whole
+    // conversion, not just the brief moment before the first preview frame
+    // arrives.
+    _sourcePreview?.pause();
     _clearPreviewImages();
     setState(() {
       _step = _Step.converting;
@@ -299,6 +330,7 @@ class _ConvertPageState extends State<ConvertPage> {
           // Best-effort cleanup; a missing/undeletable temp file isn't fatal.
         }
         _clearPreviewImages();
+        _sourcePreview?.play();
         if (!mounted) return;
         setState(() {
           _step = _Step.ready;
@@ -326,6 +358,7 @@ class _ConvertPageState extends State<ConvertPage> {
     } catch (e) {
       await HdrConverter.videoClose();
       _clearPreviewImages();
+      _sourcePreview?.play();
       if (!mounted) return;
       setState(() {
         _error = 'Conversion failed.';
@@ -456,6 +489,7 @@ class _ConvertPageState extends State<ConvertPage> {
   }
 
   Future<void> _share() async {
+    _playClickSound();
     final outputPath = _outputPath;
     if (outputPath == null) return;
     final renderBox = _shareButtonKey.currentContext?.findRenderObject() as RenderBox?;
@@ -468,6 +502,7 @@ class _ConvertPageState extends State<ConvertPage> {
   }
 
   Future<void> _reset() async {
+    _playClickSound();
     await _sourcePreview?.dispose();
     await _resultPlayer?.dispose();
     _clearPreviewImages();
@@ -666,9 +701,12 @@ class _ConvertPageState extends State<ConvertPage> {
                                   shadows: _overlayShadows,
                                 ),
                                 tooltip: 'Privacy Policy',
-                                onPressed: () => Navigator.of(context).push(
-                                  MaterialPageRoute(builder: (_) => const PrivacyPolicyPage()),
-                                ),
+                                onPressed: () {
+                                  _playClickSound();
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute(builder: (_) => const PrivacyPolicyPage()),
+                                  );
+                                },
                               ),
                             ],
                           ),

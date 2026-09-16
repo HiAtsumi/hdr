@@ -564,6 +564,24 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
     AVAssetTrack *track = tracks.firstObject;
     CGAffineTransform transform = track.preferredTransform;
 
+    // renderSize (width/height, the caller's possibly-downscaled target, e.g.
+    // 4K capped to 1920 on the long edge — see _scaledVideoDimensions) can
+    // differ from the track's own (rotation-applied) natural size. Without an
+    // explicit scale on top of the rotation transform, AVFoundation draws the
+    // source at its native pixel size positioned at the origin of the render
+    // canvas — for a downscaled target that only fills the canvas's top-left
+    // corner with a crop of the source, leaving the rest blank instead of the
+    // whole frame scaled down.
+    CGRect transformedRect = CGRectApplyAffineTransform(
+        CGRectMake(0, 0, track.naturalSize.width, track.naturalSize.height), transform);
+    CGSize transformedSize = CGSizeMake(fabs(transformedRect.size.width), fabs(transformedRect.size.height));
+    CGAffineTransform renderTransform = transform;
+    if (transformedSize.width > 0 && transformedSize.height > 0) {
+      CGFloat sx = width / transformedSize.width;
+      CGFloat sy = height / transformedSize.height;
+      renderTransform = CGAffineTransformConcat(transform, CGAffineTransformMakeScale(sx, sy));
+    }
+
     AVMutableVideoComposition *composition = [AVMutableVideoComposition videoComposition];
     composition.renderSize = CGSizeMake(width, height);
     composition.frameDuration = CMTimeMake(1, (int32_t)fps);
@@ -572,7 +590,7 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
     instruction.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
     AVMutableVideoCompositionLayerInstruction *layerInstruction =
         [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:track];
-    [layerInstruction setTransform:transform atTime:kCMTimeZero];
+    [layerInstruction setTransform:renderTransform atTime:kCMTimeZero];
     instruction.layerInstructions = @[ layerInstruction ];
     composition.instructions = @[ instruction ];
 

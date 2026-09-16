@@ -24,5 +24,6 @@ import UIKit
       hdrImageViewFactory,
       withId: "com.eonlineservice.hdr/hdr_image_view"
     )
+    ClickSoundPlugin.register(with: registrar)
   }
 }

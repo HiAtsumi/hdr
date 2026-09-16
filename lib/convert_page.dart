@@ -5,7 +5,7 @@ import 'dart:ui' as ui;
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show PlatformException;
+import 'package:flutter/services.dart' show MethodChannel, PlatformException;
 import 'package:hdr_converter/hdr_converter.dart';
 import 'package:hdr_video_encoder/hdr_video_encoder.dart';
 import 'package:image_picker/image_picker.dart';
@@ -83,20 +83,42 @@ class _ConvertPageState extends State<ConvertPage> {
   // A soft custom tap sound for button presses — the platform's built-in
   // SystemSoundType.click (a raw keyboard-click sample) reads as a harsh
   // "pop" over a phone speaker, so we ship our own gentler effect instead.
-  final _clickPlayer = AudioPlayer(playerId: 'ui_click');
+  //
+  // On iOS this plays through AudioServices (see ClickSoundPlugin.swift) —
+  // the same instant-latency mechanism SystemSoundType.click itself uses.
+  // audioplayers' AVAudioPlayer-based playback has to activate the audio
+  // session and prepare a buffer on every call, which reads as sluggish for
+  // a tap sound that needs to feel instant; AudioServices skips all of that.
+  // Other platforms fall back to a pool of pre-loaded players (a single
+  // reused player was audibly delayed or silent on some taps, since reusing
+  // one player's seek+resume serialises every tap through its own state
+  // machine).
+  static const _clickChannel = MethodChannel('com.eonlineservice.hdr/click_sound');
+  AudioPool? _clickPool;
 
   @override
   void initState() {
     super.initState();
-    _clickPlayer.setReleaseMode(ReleaseMode.stop);
-    _clickPlayer.setSource(AssetSource('sounds/click.wav'));
+    if (!Platform.isIOS) {
+      AudioPool.createFromAsset(
+        path: 'sounds/click.wav',
+        minPlayers: 2,
+        maxPlayers: 4,
+      ).then((pool) {
+        if (!mounted) {
+          pool.dispose();
+          return;
+        }
+        _clickPool = pool;
+      });
+    }
   }
 
   @override
   void dispose() {
     _sourcePreview?.dispose();
     _resultPlayer?.dispose();
-    _clickPlayer.dispose();
+    _clickPool?.dispose();
     for (final image in _previewImageHistory) {
       image.dispose();
     }
@@ -108,12 +130,12 @@ class _ConvertPageState extends State<ConvertPage> {
     return _videoExtensions.contains(ext) ? _Kind.video : _Kind.image;
   }
 
-  // Rewinds and replays our bundled tap sound. seek+resume (rather than
-  // play(), which re-resolves the asset source each time) keeps repeated
-  // taps snappy.
   void _playClickSound() {
-    _clickPlayer.seek(Duration.zero);
-    _clickPlayer.resume();
+    if (Platform.isIOS) {
+      unawaited(_clickChannel.invokeMethod('play'));
+    } else {
+      unawaited(_clickPool?.start());
+    }
   }
 
   Future<void> _pick() async {

@@ -34,6 +34,12 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 }
@@ -52,4 +58,9 @@ dependencies {
     // HDRプレビュー用Platform View(HdrVideoPlayerView)がExoPlayerを直接使うため明示的に依存させる。
     // video_player_androidが内部で使うバージョンに合わせている。
     implementation("androidx.media3:media3-exoplayer:1.8.0")
+
+    // google_mobile_ads(play-services-ads-api)がandroidx.work:2.7.0を要求するが、
+    // このバージョンのWorkDatabase(Room 2.2.5)は新しいAndroidバージョンで初期化に失敗しクラッシュするため、
+    // 新しいバージョンに強制アップグレードする。
+    implementation("androidx.work:work-runtime:2.9.1")
 }

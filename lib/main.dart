@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 
@@ -11,6 +12,10 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   if (!kIsWeb && (Platform.isIOS || Platform.isAndroid)) {
     await MobileAds.instance.initialize();
+    // Full-screen media viewer: hide the status bar and (on Android) the
+    // navigation bar. immersiveSticky lets a swipe from the edge reveal
+    // them briefly, then they auto-hide again.
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   }
   runApp(const HdrConverterApp());
 }
@@ -22,6 +27,7 @@ class HdrConverterApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'HDR converter',
+      debugShowCheckedModeBanner: false,
       // ロケール未指定だとCJKのフォールバックフォントが中国語(簡体字)向けの
       // 字形で描画されることがあるため、日本語ロケールを明示して漢字の字形を
       // スマホ標準(日本語)にする。

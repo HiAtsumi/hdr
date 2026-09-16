@@ -38,6 +38,7 @@ dependencies:
   path_provider: ^2.1.6
   path: ^1.9.1
   share_plus: ^13.3.0
+  url_launcher: ^6.3.2
   video_player: ^2.14.0
   hdr_video_encoder:
     path: packages/hdr_video_encoder
@@ -66,6 +67,9 @@ flutter_launcher_icons:
   image_path: "assets/icon/app_icon.png"
   ios: true
   android: true
+  image_path_android: "assets/icon/app_icon_android.png"
+  adaptive_icon_background: "#324152"
+  adaptive_icon_foreground: "assets/icon/app_icon_android.png"
   macos:
     generate: true
     image_path: "assets/icon/app_icon.png"

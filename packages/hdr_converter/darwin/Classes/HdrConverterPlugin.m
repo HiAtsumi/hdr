@@ -64,6 +64,65 @@ static inline float glowFactorf(float whiteness, float knee, float maxBoost) {
   return 1.0f + smoothstepf(knee, 1.0f, whiteness) * (maxBoost - 1.0f);
 }
 
+// CGImageSourceCreateImageAtIndex decodes raw pixel data only and ignores
+// the EXIF orientation tag — many JPEGs (camera photos in particular) store
+// portrait shots as landscape pixel data plus a tag telling viewers how to
+// display it. Since we write the output with no such tag, a portrait
+// source ends up saved sideways/with swapped dimensions unless we bake the
+// rotation into the actual pixels first. `width`/`height` are the source
+// CGImage's own (pre-rotation) dimensions.
+static CGAffineTransform HdrExifOrientationTransform(CGImagePropertyOrientation orientation, CGFloat width,
+                                                       CGFloat height) {
+  CGAffineTransform transform = CGAffineTransformIdentity;
+
+  switch (orientation) {
+    case kCGImagePropertyOrientationDown:
+    case kCGImagePropertyOrientationDownMirrored:
+      transform = CGAffineTransformMakeTranslation(width, height);
+      transform = CGAffineTransformRotate(transform, (CGFloat)M_PI);
+      break;
+    case kCGImagePropertyOrientationLeft:
+    case kCGImagePropertyOrientationLeftMirrored:
+      transform = CGAffineTransformMakeTranslation(width, 0);
+      transform = CGAffineTransformRotate(transform, (CGFloat)M_PI_2);
+      break;
+    case kCGImagePropertyOrientationRight:
+    case kCGImagePropertyOrientationRightMirrored:
+      transform = CGAffineTransformMakeTranslation(0, height);
+      transform = CGAffineTransformRotate(transform, (CGFloat)-M_PI_2);
+      break;
+    case kCGImagePropertyOrientationUp:
+    case kCGImagePropertyOrientationUpMirrored:
+      break;
+  }
+
+  switch (orientation) {
+    case kCGImagePropertyOrientationUpMirrored:
+    case kCGImagePropertyOrientationDownMirrored:
+      transform = CGAffineTransformTranslate(transform, width, 0);
+      transform = CGAffineTransformScale(transform, -1, 1);
+      break;
+    case kCGImagePropertyOrientationLeftMirrored:
+    case kCGImagePropertyOrientationRightMirrored:
+      transform = CGAffineTransformTranslate(transform, height, 0);
+      transform = CGAffineTransformScale(transform, -1, 1);
+      break;
+    case kCGImagePropertyOrientationUp:
+    case kCGImagePropertyOrientationDown:
+    case kCGImagePropertyOrientationLeft:
+    case kCGImagePropertyOrientationRight:
+      break;
+  }
+
+  return transform;
+}
+
+static BOOL HdrExifOrientationSwapsDimensions(CGImagePropertyOrientation orientation) {
+  return orientation == kCGImagePropertyOrientationLeft || orientation == kCGImagePropertyOrientationRight ||
+         orientation == kCGImagePropertyOrientationLeftMirrored ||
+         orientation == kCGImagePropertyOrientationRightMirrored;
+}
+
 static const float kSdrWhiteNits = 203.0f;
 static const float kHlgSdrWhiteScene = 0.5f;
 
@@ -210,42 +269,64 @@ typedef NS_ENUM(NSInteger, HdrPrimariesMode) { HdrPrimaries2020 = 0, HdrPrimarie
 }
 
 - (void)videoReadFrame:(FlutterResult)result {
-  if (!self.videoOutput || self.videoReader.status != AVAssetReaderStatusReading) {
-    result(nil);
-    return;
-  }
-  CMSampleBufferRef sbuf = [self.videoOutput copyNextSampleBuffer];
-  if (!sbuf) {
-    result(nil);
-    return;
-  }
-  CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sbuf);
-  if (!pb) {
-    CFRelease(sbuf);
-    result(nil);
-    return;
-  }
-
-  CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-  int w = self.videoWidth, h = self.videoHeight;
-  size_t stride = CVPixelBufferGetBytesPerRow(pb);
-  const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
-  NSMutableData *rgba = [NSMutableData dataWithLength:(NSUInteger)w * h * 4];
-  uint8_t *dst = (uint8_t *)rgba.mutableBytes;
-  for (int y = 0; y < h; y++) {
-    const uint8_t *srow = base + (size_t)y * stride;  // BGRA
-    uint8_t *drow = dst + (size_t)y * w * 4;
-    for (int x = 0; x < w; x++) {
-      drow[x * 4 + 0] = srow[x * 4 + 2];  // R
-      drow[x * 4 + 1] = srow[x * 4 + 1];  // G
-      drow[x * 4 + 2] = srow[x * 4 + 0];  // B
-      drow[x * 4 + 3] = srow[x * 4 + 3];  // A
+  // This is called once per frame in a tight Dart-side loop for the whole
+  // video. Without an explicit pool, the autoreleased temporaries AVFoundation
+  // and Foundation APIs create here (and there are several per call) only
+  // get drained whenever the surrounding run loop next happens to do so,
+  // which on a long video can mean thousands of frames' worth pile up
+  // in memory before that happens — read: this is what was ballooning
+  // memory usage until the OS jetsam-killed the app under pressure.
+  @autoreleasepool {
+    if (!self.videoOutput || self.videoReader.status != AVAssetReaderStatusReading) {
+      result(nil);
+      return;
     }
-  }
-  CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-  CFRelease(sbuf);
+    CMSampleBufferRef sbuf = [self.videoOutput copyNextSampleBuffer];
+    if (!sbuf) {
+      result(nil);
+      return;
+    }
+    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sbuf);
+    if (!pb) {
+      CFRelease(sbuf);
+      result(nil);
+      return;
+    }
 
-  result([FlutterStandardTypedData typedDataWithBytes:rgba]);
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    int w = self.videoWidth, h = self.videoHeight;
+    // The composition is configured to render at exactly (w, h), but some
+    // sources — in particular ones re-exported by third-party editors, whose
+    // naturalSize/preferredTransform metadata AVFoundation reads a bit
+    // differently than the video actually decodes — end up with a real
+    // composited buffer slightly smaller than that. Trusting (w, h) for the
+    // read regardless walks past the buffer's actual memory and crashes;
+    // clamp to what the buffer itself reports instead.
+    size_t bufWidth = CVPixelBufferGetWidth(pb);
+    size_t bufHeight = CVPixelBufferGetHeight(pb);
+    int readW = (int)MIN((size_t)w, bufWidth);
+    int readH = (int)MIN((size_t)h, bufHeight);
+    size_t stride = CVPixelBufferGetBytesPerRow(pb);
+    const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
+    // Zero-filled: if the real buffer came in smaller, the unread edge is
+    // black instead of uninitialized memory.
+    NSMutableData *rgba = [NSMutableData dataWithLength:(NSUInteger)w * h * 4];
+    uint8_t *dst = (uint8_t *)rgba.mutableBytes;
+    for (int y = 0; y < readH; y++) {
+      const uint8_t *srow = base + (size_t)y * stride;  // BGRA
+      uint8_t *drow = dst + (size_t)y * w * 4;
+      for (int x = 0; x < readW; x++) {
+        drow[x * 4 + 0] = srow[x * 4 + 2];  // R
+        drow[x * 4 + 1] = srow[x * 4 + 1];  // G
+        drow[x * 4 + 2] = srow[x * 4 + 0];  // B
+        drow[x * 4 + 3] = srow[x * 4 + 3];  // A
+      }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    CFRelease(sbuf);
+
+    result([FlutterStandardTypedData typedDataWithBytes:rgba]);
+  }
 }
 
 - (void)videoClose:(FlutterResult)result {
@@ -358,132 +439,163 @@ typedef NS_ENUM(NSInteger, HdrPrimariesMode) { HdrPrimaries2020 = 0, HdrPrimarie
           ? HdrPrimariesP3
           : HdrPrimaries2020;
 
-  NSURL *inURL = [NSURL fileURLWithPath:inputPath];
-  CGImageSourceRef srcRef = CGImageSourceCreateWithURL((__bridge CFURLRef)inURL, NULL);
-  if (!srcRef) {
-    result([FlutterError errorWithCode:@"decodeFailed" message:@"could not open input image" details:nil]);
-    return;
-  }
-  CGImageRef cgImage = CGImageSourceCreateImageAtIndex(srcRef, 0, NULL);
-  CFRelease(srcRef);
-  if (!cgImage) {
-    result([FlutterError errorWithCode:@"decodeFailed" message:@"could not decode input image" details:nil]);
-    return;
-  }
+  // The per-pixel float conversion below and HEIC encoding are heavy enough
+  // (multi-second on a large photo) that running them on the calling thread
+  // — which is the main/UI thread, since FlutterMethodChannel dispatches
+  // call handlers there by default — freezes the whole app, including the
+  // in-progress spinner Flutter is trying to animate on screen. Do the work
+  // on a background queue and hop back to main only to call `result`.
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    void (^finish)(id) = ^(id value) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        result(value);
+      });
+    };
 
-  size_t width = CGImageGetWidth(cgImage);
-  size_t height = CGImageGetHeight(cgImage);
-
-  // Normalise to 8-bit sRGB RGBA regardless of the source's own colour space.
-  CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-  size_t srcStride = width * 4;
-  uint8_t *srcBuf = (uint8_t *)calloc(srcStride * height, 1);
-  CGContextRef srcCtx = CGBitmapContextCreate(
-      srcBuf, width, height, 8, srcStride, srgb,
-      (CGBitmapInfo)kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-  CGContextDrawImage(srcCtx, CGRectMake(0, 0, width, height), cgImage);
-  CGContextRelease(srcCtx);
-  CGColorSpaceRelease(srgb);
-  CGImageRelease(cgImage);
-
-  // Per-pixel transform -> half-float RGBA in the target transfer/primaries.
-  // Same maths as hdr_video_encoder's fillHalf; alpha forced opaque (HDR
-  // stills authored this way have no meaningful alpha channel here).
-  size_t dstStride = width * 4 * sizeof(__fp16);
-  __fp16 *dstBuf = (__fp16 *)malloc(dstStride * height);
-  for (size_t y = 0; y < height; y++) {
-    const uint8_t *srow = srcBuf + y * srcStride;
-    __fp16 *drow = dstBuf + y * width * 4;
-    for (size_t x = 0; x < width; x++) {
-      float sr = srow[x * 4 + 0] / 255.0f;
-      float sg = srow[x * 4 + 1] / 255.0f;
-      float sb = srow[x * 4 + 2] / 255.0f;
-      float k = glowFactorf(fminf(sr, fminf(sg, sb)), glowKnee, maxBoost);
-      float r = srgbToLinear(sr) * k;
-      float g = srgbToLinear(sg) * k;
-      float b = srgbToLinear(sb) * k;
-
-      if (saturation != 1.0f) {
-        float yy = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-        r = yy + saturation * (r - yy);
-        g = yy + saturation * (g - yy);
-        b = yy + saturation * (b - yy);
-      }
-
-      if (primaries == HdrPrimaries2020) {
-        lin709ToLin2020(&r, &g, &b);
-      } else {
-        lin709ToLinP3(&r, &g, &b);
-      }
-
-      float er, eg, eb;
-      if (transfer == HdrTransferPq) {
-        er = pqOetf(fminf(r * sdrWhiteNits, 10000.0f) / 10000.0f);
-        eg = pqOetf(fminf(g * sdrWhiteNits, 10000.0f) / 10000.0f);
-        eb = pqOetf(fminf(b * sdrWhiteNits, 10000.0f) / 10000.0f);
-      } else {
-        float yl = 0.2627f * r + 0.6780f * g + 0.0593f * b;
-        float comp = powf(fmaxf(yl, 1.0e-4f), -1.0f / 3.0f);
-        if (comp > 2.5f) comp = 2.5f;
-        er = hlgOetf(r * comp * kHlgSdrWhiteScene);
-        eg = hlgOetf(g * comp * kHlgSdrWhiteScene);
-        eb = hlgOetf(b * comp * kHlgSdrWhiteScene);
-      }
-
-      drow[x * 4 + 0] = (__fp16)er;
-      drow[x * 4 + 1] = (__fp16)eg;
-      drow[x * 4 + 2] = (__fp16)eb;
-      drow[x * 4 + 3] = (__fp16)1.0f;
+    NSURL *inURL = [NSURL fileURLWithPath:inputPath];
+    CGImageSourceRef srcRef = CGImageSourceCreateWithURL((__bridge CFURLRef)inURL, NULL);
+    if (!srcRef) {
+      finish([FlutterError errorWithCode:@"decodeFailed" message:@"could not open input image" details:nil]);
+      return;
     }
-  }
-  free(srcBuf);
+    CGImagePropertyOrientation orientation = kCGImagePropertyOrientationUp;
+    CFDictionaryRef properties = CGImageSourceCopyPropertiesAtIndex(srcRef, 0, NULL);
+    if (properties) {
+      CFNumberRef orientationNum = CFDictionaryGetValue(properties, kCGImagePropertyOrientation);
+      if (orientationNum) {
+        int value = 1;
+        CFNumberGetValue(orientationNum, kCFNumberIntType, &value);
+        orientation = (CGImagePropertyOrientation)value;
+      }
+      CFRelease(properties);
+    }
 
-  CFStringRef colorSpaceName;
-  if (transfer == HdrTransferPq) {
-    colorSpaceName = kCGColorSpaceITUR_2100_PQ;
-  } else if (primaries == HdrPrimariesP3) {
-    colorSpaceName = kCGColorSpaceDisplayP3_HLG;
-  } else {
-    colorSpaceName = kCGColorSpaceITUR_2100_HLG;
-  }
-  CGColorSpaceRef hdrCS = CGColorSpaceCreateWithName(colorSpaceName);
-  if (!hdrCS) {
-    free(dstBuf);
-    result([FlutterError errorWithCode:@"colorSpace" message:@"HDR colour space unavailable on this OS" details:nil]);
-    return;
-  }
+    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(srcRef, 0, NULL);
+    CFRelease(srcRef);
+    if (!cgImage) {
+      finish([FlutterError errorWithCode:@"decodeFailed" message:@"could not decode input image" details:nil]);
+      return;
+    }
 
-  CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, dstBuf, dstStride * height, ReleaseHalfFloatBuffer);
-  CGBitmapInfo bitmapInfo = (CGBitmapInfo)kCGBitmapFloatComponents | kCGBitmapByteOrder16Host |
-                            (CGBitmapInfo)kCGImageAlphaPremultipliedLast;
-  CGImageRef hdrImage = CGImageCreate(width, height, 16, 64, dstStride, hdrCS, bitmapInfo, provider, NULL, false,
-                                       kCGRenderingIntentDefault);
-  CGDataProviderRelease(provider);
-  CGColorSpaceRelease(hdrCS);
-  if (!hdrImage) {
-    result([FlutterError errorWithCode:@"encodeFailed" message:@"could not build HDR image" details:nil]);
-    return;
-  }
+    size_t srcWidth = CGImageGetWidth(cgImage);
+    size_t srcHeight = CGImageGetHeight(cgImage);
+    size_t width = HdrExifOrientationSwapsDimensions(orientation) ? srcHeight : srcWidth;
+    size_t height = HdrExifOrientationSwapsDimensions(orientation) ? srcWidth : srcHeight;
 
-  NSURL *outURL = [NSURL fileURLWithPath:outputPath];
-  [[NSFileManager defaultManager] removeItemAtURL:outURL error:nil];
-  CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)outURL, (CFStringRef)@"public.heic", 1, NULL);
-  if (!dest) {
+    // Normalise to 8-bit sRGB RGBA regardless of the source's own colour space,
+    // baking the EXIF orientation into the pixels as we go (see
+    // HdrExifOrientationTransform above).
+    CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    size_t srcStride = width * 4;
+    uint8_t *srcBuf = (uint8_t *)calloc(srcStride * height, 1);
+    CGContextRef srcCtx = CGBitmapContextCreate(
+        srcBuf, width, height, 8, srcStride, srgb,
+        (CGBitmapInfo)kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGContextConcatCTM(srcCtx, HdrExifOrientationTransform(orientation, srcWidth, srcHeight));
+    CGContextDrawImage(srcCtx, CGRectMake(0, 0, srcWidth, srcHeight), cgImage);
+    CGContextRelease(srcCtx);
+    CGColorSpaceRelease(srgb);
+    CGImageRelease(cgImage);
+
+    // Per-pixel transform -> half-float RGBA in the target transfer/primaries.
+    // Same maths as hdr_video_encoder's fillHalf; alpha forced opaque (HDR
+    // stills authored this way have no meaningful alpha channel here).
+    size_t dstStride = width * 4 * sizeof(__fp16);
+    __fp16 *dstBuf = (__fp16 *)malloc(dstStride * height);
+    for (size_t y = 0; y < height; y++) {
+      const uint8_t *srow = srcBuf + y * srcStride;
+      __fp16 *drow = dstBuf + y * width * 4;
+      for (size_t x = 0; x < width; x++) {
+        float sr = srow[x * 4 + 0] / 255.0f;
+        float sg = srow[x * 4 + 1] / 255.0f;
+        float sb = srow[x * 4 + 2] / 255.0f;
+        float k = glowFactorf(fminf(sr, fminf(sg, sb)), glowKnee, maxBoost);
+        float r = srgbToLinear(sr) * k;
+        float g = srgbToLinear(sg) * k;
+        float b = srgbToLinear(sb) * k;
+
+        if (saturation != 1.0f) {
+          float yy = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+          r = yy + saturation * (r - yy);
+          g = yy + saturation * (g - yy);
+          b = yy + saturation * (b - yy);
+        }
+
+        if (primaries == HdrPrimaries2020) {
+          lin709ToLin2020(&r, &g, &b);
+        } else {
+          lin709ToLinP3(&r, &g, &b);
+        }
+
+        float er, eg, eb;
+        if (transfer == HdrTransferPq) {
+          er = pqOetf(fminf(r * sdrWhiteNits, 10000.0f) / 10000.0f);
+          eg = pqOetf(fminf(g * sdrWhiteNits, 10000.0f) / 10000.0f);
+          eb = pqOetf(fminf(b * sdrWhiteNits, 10000.0f) / 10000.0f);
+        } else {
+          float yl = 0.2627f * r + 0.6780f * g + 0.0593f * b;
+          float comp = powf(fmaxf(yl, 1.0e-4f), -1.0f / 3.0f);
+          if (comp > 2.5f) comp = 2.5f;
+          er = hlgOetf(r * comp * kHlgSdrWhiteScene);
+          eg = hlgOetf(g * comp * kHlgSdrWhiteScene);
+          eb = hlgOetf(b * comp * kHlgSdrWhiteScene);
+        }
+
+        drow[x * 4 + 0] = (__fp16)er;
+        drow[x * 4 + 1] = (__fp16)eg;
+        drow[x * 4 + 2] = (__fp16)eb;
+        drow[x * 4 + 3] = (__fp16)1.0f;
+      }
+    }
+    free(srcBuf);
+
+    CFStringRef colorSpaceName;
+    if (transfer == HdrTransferPq) {
+      colorSpaceName = kCGColorSpaceITUR_2100_PQ;
+    } else if (primaries == HdrPrimariesP3) {
+      colorSpaceName = kCGColorSpaceDisplayP3_HLG;
+    } else {
+      colorSpaceName = kCGColorSpaceITUR_2100_HLG;
+    }
+    CGColorSpaceRef hdrCS = CGColorSpaceCreateWithName(colorSpaceName);
+    if (!hdrCS) {
+      free(dstBuf);
+      finish([FlutterError errorWithCode:@"colorSpace" message:@"HDR colour space unavailable on this OS" details:nil]);
+      return;
+    }
+
+    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, dstBuf, dstStride * height, ReleaseHalfFloatBuffer);
+    CGBitmapInfo bitmapInfo = (CGBitmapInfo)kCGBitmapFloatComponents | kCGBitmapByteOrder16Host |
+                              (CGBitmapInfo)kCGImageAlphaPremultipliedLast;
+    CGImageRef hdrImage = CGImageCreate(width, height, 16, 64, dstStride, hdrCS, bitmapInfo, provider, NULL, false,
+                                         kCGRenderingIntentDefault);
+    CGDataProviderRelease(provider);
+    CGColorSpaceRelease(hdrCS);
+    if (!hdrImage) {
+      finish([FlutterError errorWithCode:@"encodeFailed" message:@"could not build HDR image" details:nil]);
+      return;
+    }
+
+    NSURL *outURL = [NSURL fileURLWithPath:outputPath];
+    [[NSFileManager defaultManager] removeItemAtURL:outURL error:nil];
+    CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)outURL, (CFStringRef)@"public.heic", 1, NULL);
+    if (!dest) {
+      CGImageRelease(hdrImage);
+      finish([FlutterError errorWithCode:@"noHeicDestination" message:@"HEIC encoding is not available on this device" details:nil]);
+      return;
+    }
+    NSDictionary *destProps = @{(id)kCGImageDestinationLossyCompressionQuality : @(0.9)};
+    CGImageDestinationAddImage(dest, hdrImage, (__bridge CFDictionaryRef)destProps);
+    BOOL ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
     CGImageRelease(hdrImage);
-    result([FlutterError errorWithCode:@"noHeicDestination" message:@"HEIC encoding is not available on this device" details:nil]);
-    return;
-  }
-  NSDictionary *destProps = @{(id)kCGImageDestinationLossyCompressionQuality : @(0.9)};
-  CGImageDestinationAddImage(dest, hdrImage, (__bridge CFDictionaryRef)destProps);
-  BOOL ok = CGImageDestinationFinalize(dest);
-  CFRelease(dest);
-  CGImageRelease(hdrImage);
 
-  if (!ok) {
-    result([FlutterError errorWithCode:@"finalizeFailed" message:@"failed to write HEIC output" details:nil]);
-    return;
-  }
-  result(nil);
+    if (!ok) {
+      finish([FlutterError errorWithCode:@"finalizeFailed" message:@"failed to write HEIC output" details:nil]);
+      return;
+    }
+    finish(nil);
+  });
 }
 
 static void ReleaseHalfFloatBuffer(void *info, const void *data, size_t size) {

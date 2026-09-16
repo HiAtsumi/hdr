@@ -26,35 +26,61 @@ class AdBanner extends StatefulWidget {
 
 class _AdBannerState extends State<AdBanner> {
   BannerAd? _bannerAd;
-  bool _requested = false;
+  int? _loadedWidth;
+  // Bumped on every (re)load request; a completion whose generation no
+  // longer matches is for a width we've since moved on from (e.g. two
+  // quick rotations) and is discarded instead of being shown.
+  int _requestGeneration = 0;
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    if (_requested) return;
-    _requested = true;
-    _loadAd();
+    // Called again whenever MediaQuery changes, including on rotation —
+    // that's how a width change (and thus the need for a differently-sized
+    // adaptive banner) is noticed.
+    _maybeReload();
   }
 
-  Future<void> _loadAd() async {
+  void _maybeReload() {
     if (!isAdsSupportedPlatform) return;
     final width = MediaQuery.sizeOf(context).width.truncate();
+    if (width == _loadedWidth) return;
+    final generation = ++_requestGeneration;
+
+    // The loaded banner's native content is a fixed pixel width/height pair
+    // (it doesn't stretch or scale with the container), so once the width
+    // has actually changed it no longer fits: too wide and it overflows
+    // past the new bounds, too narrow and it just looks undersized. Drop it
+    // immediately rather than leaving a wrongly-sized banner up while the
+    // correctly-sized replacement loads.
+    final previous = _bannerAd;
+    if (previous != null) {
+      setState(() => _bannerAd = null);
+      previous.dispose();
+    }
+    _loadAd(width, generation);
+  }
+
+  Future<void> _loadAd(int width, int generation) async {
     final size = await AdSize.getLargeAnchoredAdaptiveBannerAdSize(width);
-    if (size == null || !mounted) return;
+    if (size == null || !mounted || generation != _requestGeneration) return;
 
     final ad = BannerAd(
       adUnitId: _testBannerAdUnitId,
       size: size,
       request: const AdRequest(),
       listener: BannerAdListener(
-        onAdLoaded: (ad) {
-          if (!mounted) {
-            ad.dispose();
+        onAdLoaded: (loadedAd) {
+          if (!mounted || generation != _requestGeneration) {
+            loadedAd.dispose();
             return;
           }
-          setState(() => _bannerAd = ad as BannerAd);
+          setState(() {
+            _bannerAd = loadedAd as BannerAd;
+            _loadedWidth = width;
+          });
         },
-        onAdFailedToLoad: (ad, error) => ad.dispose(),
+        onAdFailedToLoad: (failedAd, error) => failedAd.dispose(),
       ),
     );
     await ad.load();

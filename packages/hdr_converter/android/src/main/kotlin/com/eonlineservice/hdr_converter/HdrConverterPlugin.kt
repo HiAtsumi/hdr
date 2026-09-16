@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Gainmap
 import android.graphics.Matrix
+import android.media.ExifInterface
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -249,8 +250,25 @@ class HdrConverterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val maxBoost = (call.argument<Double>("maxBoost") ?: 2.0).toFloat().coerceAtLeast(1.0f)
         val glowKnee = (call.argument<Double>("glowKnee") ?: 0.7).toFloat()
 
-        val sdrBitmap = BitmapFactory.decodeFile(inputPath)
+        var sdrBitmap = BitmapFactory.decodeFile(inputPath)
             ?: throw IllegalArgumentException("cannot decode image at $inputPath")
+
+        // BitmapFactory decodes raw pixel data only and ignores the EXIF
+        // Orientation tag — many JPEGs (camera photos in particular) store
+        // portrait shots as landscape pixel data plus a rotation tag telling
+        // viewers how to display it. Since the JPEG we write out below has
+        // no such tag, a portrait source ends up saved sideways/with
+        // swapped dimensions unless we rotate the actual pixels first.
+        val orientation = try {
+            ExifInterface(inputPath).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL,
+            )
+        } catch (e: Exception) {
+            ExifInterface.ORIENTATION_NORMAL
+        }
+        sdrBitmap = applyExifOrientation(sdrBitmap, orientation)
+
         val width = sdrBitmap.width
         val height = sdrBitmap.height
 
@@ -266,6 +284,29 @@ class HdrConverterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         FileOutputStream(outputPath).use { out -> sdrBitmap.compress(Bitmap.CompressFormat.JPEG, 92, out) }
         sdrBitmap.recycle()
         result.success(null)
+    }
+
+    private fun applyExifOrientation(bitmap: Bitmap, orientation: Int): Bitmap {
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> {
+                matrix.postRotate(90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_TRANSVERSE -> {
+                matrix.postRotate(-90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(-90f)
+            else -> return bitmap
+        }
+        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        if (rotated !== bitmap) bitmap.recycle()
+        return rotated
     }
 
     private fun buildAndAttachGainmap(

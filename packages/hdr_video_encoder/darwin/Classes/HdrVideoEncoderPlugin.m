@@ -109,6 +109,26 @@ typedef NS_ENUM(NSInteger, HdrPrimariesMode) { HdrPrimaries709 = 0, HdrPrimaries
 @property(nonatomic) float maxCll;   // nits, 0 == unset
 @property(nonatomic) float maxFall;  // nits, 0 == unset
 @property(nonatomic) float sdrWhiteNits;  // PQ anchor, default kSdrWhiteNits
+
+// State for convertVideo: (the single-call, no-Dart-round-trip pipeline —
+// see that method for why it exists). atomic: convertFrameIdx/convertCancelRequested
+// are written from the background conversion queue and read from the main
+// queue (getConvertProgress / cancelConvertVideo), so plain ivars would risk
+// torn reads; the default `atomic` property semantics are enough here since
+// each is a single word read/written independently, never compound.
+@property(atomic) int convertFrameIdx;
+@property(atomic) int convertTotalFrames;
+@property(atomic) BOOL convertCancelRequested;
+
+// Latest live-preview thumbnail from an in-flight convertVideo: — small
+// (long edge capped, see convertVideo:) so polling it periodically doesn't
+// reintroduce the full-resolution-buffer-per-frame memory cost that
+// convertVideo: exists to avoid. generation increments each time a new one
+// is captured, so Dart can tell whether it's already shown this one.
+@property(atomic) NSData *latestPreviewFrame;
+@property(atomic) int latestPreviewWidth;
+@property(atomic) int latestPreviewHeight;
+@property(atomic) int latestPreviewGeneration;
 @end
 
 // CIE 1931 xy chromaticity of each primaries set's own R/G/B/white point (D65),
@@ -197,6 +217,25 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
       [self appendFrame:call.arguments result:result];
     } else if ([@"finish" isEqualToString:call.method]) {
       [self finish:result];
+    } else if ([@"convertVideo" isEqualToString:call.method]) {
+      [self convertVideo:call.arguments result:result];
+    } else if ([@"getConvertProgress" isEqualToString:call.method]) {
+      result(@{@"frameIdx" : @(self.convertFrameIdx), @"totalFrames" : @(self.convertTotalFrames)});
+    } else if ([@"cancelConvertVideo" isEqualToString:call.method]) {
+      self.convertCancelRequested = YES;
+      result(nil);
+    } else if ([@"getLatestPreviewFrame" isEqualToString:call.method]) {
+      NSData *frame = self.latestPreviewFrame;
+      if (!frame) {
+        result(nil);
+      } else {
+        result(@{
+          @"generation" : @(self.latestPreviewGeneration),
+          @"width" : @(self.latestPreviewWidth),
+          @"height" : @(self.latestPreviewHeight),
+          @"bytes" : [FlutterStandardTypedData typedDataWithBytes:frame],
+        });
+      }
     } else {
       result(FlutterMethodNotImplemented);
     }
@@ -399,45 +438,572 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
 }
 
 - (void)appendFrame:(NSDictionary *)args result:(FlutterResult)result {
-  if (!self.adaptor || self.writer.status != AVAssetWriterStatusWriting) {
-    result([FlutterError errorWithCode:@"notReady" message:@"encoder not set up" details:nil]);
-    return;
-  }
-  FlutterStandardTypedData *sdr = args[@"sdrRgba"];
-  const uint8_t *sdrBytes = sdr.data.bytes;
+  // Called once per frame for the whole video — see the matching comment on
+  // hdr_converter's videoReadFrame: for why this needs its own pool rather
+  // than relying on whatever run loop turn eventually drains one.
+  @autoreleasepool {
+    if (!self.adaptor || self.writer.status != AVAssetWriterStatusWriting) {
+      result([FlutterError errorWithCode:@"notReady" message:@"encoder not set up" details:nil]);
+      return;
+    }
+    FlutterStandardTypedData *sdr = args[@"sdrRgba"];
+    const uint8_t *sdrBytes = sdr.data.bytes;
 
-  CVPixelBufferRef pb = NULL;
-  CVReturn cv = CVPixelBufferPoolCreatePixelBuffer(NULL, self.adaptor.pixelBufferPool, &pb);
-  if (cv != kCVReturnSuccess || !pb) {
-    result([FlutterError errorWithCode:@"poolBuffer"
-                              message:[NSString stringWithFormat:@"CVPixelBufferPoolCreatePixelBuffer %d", cv]
-                              details:nil]);
-    return;
+    CVPixelBufferRef pb = NULL;
+    CVReturn cv = CVPixelBufferPoolCreatePixelBuffer(NULL, self.adaptor.pixelBufferPool, &pb);
+    if (cv != kCVReturnSuccess || !pb) {
+      result([FlutterError errorWithCode:@"poolBuffer"
+                                message:[NSString stringWithFormat:@"CVPixelBufferPoolCreatePixelBuffer %d", cv]
+                                details:nil]);
+      return;
+    }
+
+    [self attachColorTagsTo:pb];
+    CVPixelBufferLockBaseAddress(pb, 0);
+    if (self.transfer == HdrTransferSdr709) {
+      [self fillBgra:pb sdr:sdrBytes];
+    } else {
+      [self fillHalf:pb sdr:sdrBytes];
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+
+    while (!self.videoInput.readyForMoreMediaData) {
+      [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    }
+    CMTime pts = CMTimeMake(self.frameIdx, self.fps);
+    BOOL ok = [self.adaptor appendPixelBuffer:pb withPresentationTime:pts];
+    CVPixelBufferRelease(pb);
+    if (!ok) {
+      result([FlutterError errorWithCode:@"appendFailed"
+                                message:self.writer.error.localizedDescription
+                                details:nil]);
+      return;
+    }
+    self.frameIdx += 1;
+    result(nil);
+  }
+}
+
+// Single-call video conversion: reads (AVAssetReader, mirroring
+// hdr_converter's videoOpen/videoReadFrame), transforms, and writes
+// (AVAssetWriter, mirroring setup:/appendFrame:) entirely natively, with no
+// per-frame trip through Dart.
+//
+// The old design had Dart drive a per-frame loop — videoReadFrame() handed a
+// full-resolution RGBA8 buffer to Dart, which immediately handed it back via
+// appendFrame(). At 4K that's a ~33MB buffer crossing the Flutter method
+// channel twice per frame on top of the native read buffer and the ~66MB
+// half-float write buffer, and on a memory-constrained device (e.g. iPhone
+// SE2, 3GB RAM) that was enough to get the app OS-killed under memory
+// pressure (jetsam, reason "vm-pageshortage") converting a plain 4K clip.
+// Transforming directly from the decoded source CVPixelBuffer into the
+// destination CVPixelBuffer removes that extra buffer and both channel
+// copies. Progress is reported by polling getConvertProgress rather than a
+// native-to-Dart callback, to avoid needing a second, bidirectional channel
+// handler for what's otherwise a one-way (Dart-calls-native) API.
+//
+// iOS-only for now (see convert_page.dart) — Android's existing per-frame
+// path hasn't shown this problem (Bitmap.recycle() frees native memory
+// immediately per frame, unlike relying on autorelease/GC timing).
+- (void)convertVideo:(NSDictionary *)args result:(FlutterResult)result {
+  NSString *inputPath = args[@"inputPath"];
+  NSString *outputPath = args[@"outputPath"];
+  int width = [args[@"width"] intValue];
+  int height = [args[@"height"] intValue];
+  int fps = [args[@"fps"] intValue];
+  if (fps <= 0) fps = 30;
+  int bitrate = [args[@"videoBitrate"] intValue];
+  NSString *transferStr = args[@"transfer"];
+  NSString *primariesStr = args[@"primaries"];
+  float maxBoost = args[@"maxBoost"] ? [args[@"maxBoost"] floatValue] : 1.0f;
+  if (maxBoost < 1.0f) maxBoost = 1.0f;
+  float glowKnee = args[@"glowKnee"] ? [args[@"glowKnee"] floatValue] : 0.7f;
+  float saturation = args[@"saturation"] ? [args[@"saturation"] floatValue] : 1.0f;
+  if (saturation <= 0.0f) saturation = 1.0f;
+  float maxCll = (args[@"maxContentLightLevel"] == nil || args[@"maxContentLightLevel"] == [NSNull null])
+                     ? 0.0f
+                     : [args[@"maxContentLightLevel"] floatValue];
+  float maxFall = (args[@"maxFrameAverageLightLevel"] == nil || args[@"maxFrameAverageLightLevel"] == [NSNull null])
+                      ? 0.0f
+                      : [args[@"maxFrameAverageLightLevel"] floatValue];
+  float sdrWhiteNits = (args[@"sdrWhiteNits"] == nil || args[@"sdrWhiteNits"] == [NSNull null])
+                            ? kSdrWhiteNits
+                            : [args[@"sdrWhiteNits"] floatValue];
+
+  HdrTransferMode transfer = HdrTransferHlg;
+  if ([transferStr isEqualToString:@"sdrRec709"]) transfer = HdrTransferSdr709;
+  else if ([transferStr isEqualToString:@"pq"]) transfer = HdrTransferPq;
+  HdrPrimariesMode primaries = HdrPrimaries2020;
+  if ([primariesStr isEqualToString:@"rec709"]) primaries = HdrPrimaries709;
+  else if ([primariesStr isEqualToString:@"displayP3"]) primaries = HdrPrimariesP3;
+  if (transfer == HdrTransferSdr709) primaries = HdrPrimaries709;
+
+  self.convertFrameIdx = 0;
+  self.convertTotalFrames = 0;
+  self.convertCancelRequested = NO;
+  self.latestPreviewFrame = nil;
+  self.latestPreviewWidth = 0;
+  self.latestPreviewHeight = 0;
+  self.latestPreviewGeneration = 0;
+
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    void (^finish)(id) = ^(id value) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        result(value);
+      });
+    };
+
+    // ---- Reader (mirrors hdr_converter's videoOpen) ----
+    NSURL *inURL = [NSURL fileURLWithPath:inputPath];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:inURL options:nil];
+    NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+    if (tracks.count == 0) {
+      finish([FlutterError errorWithCode:@"noVideoTrack" message:@"file has no video track" details:nil]);
+      return;
+    }
+    AVAssetTrack *track = tracks.firstObject;
+    CGAffineTransform transform = track.preferredTransform;
+
+    AVMutableVideoComposition *composition = [AVMutableVideoComposition videoComposition];
+    composition.renderSize = CGSizeMake(width, height);
+    composition.frameDuration = CMTimeMake(1, (int32_t)fps);
+    AVMutableVideoCompositionInstruction *instruction =
+        [AVMutableVideoCompositionInstruction videoCompositionInstruction];
+    instruction.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
+    AVMutableVideoCompositionLayerInstruction *layerInstruction =
+        [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:track];
+    [layerInstruction setTransform:transform atTime:kCMTimeZero];
+    instruction.layerInstructions = @[ layerInstruction ];
+    composition.instructions = @[ instruction ];
+
+    NSError *readerError = nil;
+    AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&readerError];
+    if (readerError) {
+      finish([FlutterError errorWithCode:@"readerInit" message:readerError.localizedDescription details:nil]);
+      return;
+    }
+    NSDictionary *readerOutputSettings = @{(id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)};
+    AVAssetReaderVideoCompositionOutput *readerOutput =
+        [[AVAssetReaderVideoCompositionOutput alloc] initWithVideoTracks:@[ track ]
+                                                            videoSettings:readerOutputSettings];
+    readerOutput.videoComposition = composition;
+    if (![reader canAddOutput:readerOutput]) {
+      finish([FlutterError errorWithCode:@"addOutput" message:@"cannot add video output" details:nil]);
+      return;
+    }
+    [reader addOutput:readerOutput];
+    if (![reader startReading]) {
+      finish([FlutterError errorWithCode:@"startReading"
+                                  message:reader.error.localizedDescription
+                                  details:nil]);
+      return;
+    }
+
+    double durationSec = CMTimeGetSeconds(asset.duration);
+    self.convertTotalFrames = MAX((int)round(durationSec * fps), 0);
+
+    // ---- Writer (mirrors setup:) ----
+    NSURL *outURL = [NSURL fileURLWithPath:outputPath];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:outputPath]) {
+      [[NSFileManager defaultManager] removeItemAtURL:outURL error:nil];
+    }
+    NSError *writerError = nil;
+    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:outURL fileType:AVFileTypeMPEG4 error:&writerError];
+    if (writerError) {
+      [reader cancelReading];
+      finish([FlutterError errorWithCode:@"writerInit" message:writerError.localizedDescription details:nil]);
+      return;
+    }
+
+    NSString *primariesTag;
+    NSString *matrixTag;
+    switch (primaries) {
+      case HdrPrimaries709:
+        primariesTag = (__bridge NSString *)kCVImageBufferColorPrimaries_ITU_R_709_2;
+        matrixTag = (__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_709_2;
+        break;
+      case HdrPrimariesP3:
+        primariesTag = (__bridge NSString *)kCVImageBufferColorPrimaries_P3_D65;
+        matrixTag = (__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_709_2;
+        break;
+      case HdrPrimaries2020:
+      default:
+        primariesTag = (__bridge NSString *)kCVImageBufferColorPrimaries_ITU_R_2020;
+        matrixTag = (__bridge NSString *)kCVImageBufferYCbCrMatrix_ITU_R_2020;
+        break;
+    }
+    NSString *transferTag;
+    switch (transfer) {
+      case HdrTransferSdr709:
+        transferTag = (__bridge NSString *)kCVImageBufferTransferFunction_ITU_R_709_2;
+        break;
+      case HdrTransferPq:
+        transferTag = (__bridge NSString *)kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ;
+        break;
+      case HdrTransferHlg:
+      default:
+        transferTag = (__bridge NSString *)kCVImageBufferTransferFunction_ITU_R_2100_HLG;
+        break;
+    }
+
+    NSMutableDictionary *compression = [@{
+      AVVideoAverageBitRateKey : @(bitrate),
+      AVVideoProfileLevelKey : (__bridge NSString *)kVTProfileLevel_HEVC_Main10_AutoLevel,
+      @"HDRMetadataInsertionMode" : @"None",
+    } mutableCopy];
+    NSDictionary *colorProps = @{
+      AVVideoColorPrimariesKey : primariesTag,
+      AVVideoTransferFunctionKey : transferTag,
+      AVVideoYCbCrMatrixKey : matrixTag,
+    };
+    NSDictionary *videoSettings = @{
+      AVVideoCodecKey : AVVideoCodecTypeHEVC,
+      AVVideoWidthKey : @(width),
+      AVVideoHeightKey : @(height),
+      AVVideoCompressionPropertiesKey : compression,
+      AVVideoColorPropertiesKey : colorProps,
+    };
+
+    CMFormatDescriptionRef sourceFormatHint = NULL;
+    if (transfer == HdrTransferPq) {
+      float maxCllNits = maxCll > 0.0f ? maxCll : sdrWhiteNits;
+      float maxFallNits = maxFall > 0.0f ? maxFall : sdrWhiteNits;
+      NSDictionary *extensions = @{
+        (__bridge NSString *)kCMFormatDescriptionExtension_ColorPrimaries : primariesTag,
+        (__bridge NSString *)kCMFormatDescriptionExtension_TransferFunction : transferTag,
+        (__bridge NSString *)kCMFormatDescriptionExtension_YCbCrMatrix : matrixTag,
+        (__bridge NSString *)kCMFormatDescriptionExtension_MasteringDisplayColorVolume :
+            HdrMasteringDisplayColorVolumeData(primaries),
+        (__bridge NSString *)kCMFormatDescriptionExtension_ContentLightLevelInfo :
+            HdrContentLightLevelData(maxCllNits, maxFallNits),
+      };
+      CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_HEVC, width, height,
+                                      (__bridge CFDictionaryRef)extensions, &sourceFormatHint);
+    }
+
+    AVAssetWriterInput *videoInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeVideo
+                                                                    outputSettings:videoSettings
+                                                                  sourceFormatHint:sourceFormatHint];
+    if (sourceFormatHint) CFRelease(sourceFormatHint);
+    videoInput.expectsMediaDataInRealTime = NO;
+
+    OSType dstFormat = (transfer == HdrTransferSdr709) ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_64RGBAHalf;
+    NSDictionary *dstAttrs = @{
+      (id)kCVPixelBufferPixelFormatTypeKey : @(dstFormat),
+      (id)kCVPixelBufferWidthKey : @(width),
+      (id)kCVPixelBufferHeightKey : @(height),
+      (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+    };
+    AVAssetWriterInputPixelBufferAdaptor *adaptor = [AVAssetWriterInputPixelBufferAdaptor
+        assetWriterInputPixelBufferAdaptorWithAssetWriterInput:videoInput
+                                    sourcePixelBufferAttributes:dstAttrs];
+
+    if (![writer canAddInput:videoInput]) {
+      [reader cancelReading];
+      finish([FlutterError errorWithCode:@"addInput" message:@"cannot add video input" details:nil]);
+      return;
+    }
+    [writer addInput:videoInput];
+    if (![writer startWriting]) {
+      [reader cancelReading];
+      finish([FlutterError errorWithCode:@"startWriting"
+                                  message:writer.error.localizedDescription
+                                  details:nil]);
+      return;
+    }
+    [writer startSessionAtSourceTime:kCMTimeZero];
+
+    // ---- Frame loop ----
+    int frameIdx = 0;
+    BOOL failed = NO;
+    NSString *failCode = nil;
+    NSString *failMessage = nil;
+    while (reader.status == AVAssetReaderStatusReading) {
+      if (self.convertCancelRequested) break;
+      @autoreleasepool {
+        CMSampleBufferRef sbuf = [readerOutput copyNextSampleBuffer];
+        if (!sbuf) break;
+        CVPixelBufferRef srcPb = CMSampleBufferGetImageBuffer(sbuf);
+        if (!srcPb) {
+          CFRelease(sbuf);
+          continue;
+        }
+        CVPixelBufferRef dstPb = NULL;
+        CVReturn cv = CVPixelBufferPoolCreatePixelBuffer(NULL, adaptor.pixelBufferPool, &dstPb);
+        if (cv != kCVReturnSuccess || !dstPb) {
+          CFRelease(sbuf);
+          failed = YES;
+          failCode = @"poolBuffer";
+          failMessage = [NSString stringWithFormat:@"CVPixelBufferPoolCreatePixelBuffer %d", cv];
+          break;
+        }
+
+        CVPixelBufferLockBaseAddress(srcPb, kCVPixelBufferLock_ReadOnly);
+        [self attachColorTagsTo:dstPb primaries:primaries transfer:transfer];
+        CVPixelBufferLockBaseAddress(dstPb, 0);
+
+        size_t srcW = CVPixelBufferGetWidth(srcPb);
+        size_t srcH = CVPixelBufferGetHeight(srcPb);
+        int readW = (int)MIN((size_t)width, srcW);
+        int readH = (int)MIN((size_t)height, srcH);
+        const uint8_t *srcBase = (const uint8_t *)CVPixelBufferGetBaseAddress(srcPb);
+        size_t srcStride = CVPixelBufferGetBytesPerRow(srcPb);
+
+        // Every few frames, capture a small live-preview thumbnail from the
+        // (undecoded-HDR, but that doesn't matter for a progress thumbnail)
+        // source — see getLatestPreviewFrame. Downscaled up front so
+        // polling this doesn't reintroduce full-resolution buffers into
+        // Dart, which is what convertVideo: exists to avoid.
+        if (frameIdx % 5 == 0) {
+          [self updatePreviewFromSrcBase:srcBase srcStride:srcStride srcW:readW srcH:readH];
+        }
+
+        if (transfer == HdrTransferSdr709) {
+          [self fillBgraDirect:dstPb
+                          width:width
+                         height:height
+                        srcBase:srcBase
+                      srcStride:srcStride
+                          readW:readW
+                          readH:readH];
+        } else {
+          [self fillHalfDirect:dstPb
+                          width:width
+                         height:height
+                       maxBoost:maxBoost
+                           knee:glowKnee
+                     saturation:saturation
+                    cllLimitNits:(maxCll > 0.0f ? maxCll : 10000.0f)
+                   sdrWhiteNits:sdrWhiteNits
+                       transfer:transfer
+                      primaries:primaries
+                        srcBase:srcBase
+                      srcStride:srcStride
+                          readW:readW
+                          readH:readH];
+        }
+
+        CVPixelBufferUnlockBaseAddress(dstPb, 0);
+        CVPixelBufferUnlockBaseAddress(srcPb, kCVPixelBufferLock_ReadOnly);
+        CFRelease(sbuf);
+
+        while (!videoInput.readyForMoreMediaData) {
+          [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+        }
+        CMTime pts = CMTimeMake(frameIdx, fps);
+        BOOL ok = [adaptor appendPixelBuffer:dstPb withPresentationTime:pts];
+        CVPixelBufferRelease(dstPb);
+        if (!ok) {
+          failed = YES;
+          failCode = @"appendFailed";
+          failMessage = writer.error.localizedDescription;
+          break;
+        }
+        frameIdx++;
+        self.convertFrameIdx = frameIdx;
+      }
+    }
+
+    [reader cancelReading];
+
+    if (failed) {
+      [videoInput markAsFinished];
+      [writer cancelWriting];
+      finish([FlutterError errorWithCode:failCode message:failMessage details:nil]);
+      return;
+    }
+
+    [videoInput markAsFinished];
+    dispatch_group_t group = dispatch_group_create();
+    dispatch_group_enter(group);
+    [writer finishWritingWithCompletionHandler:^{
+      dispatch_group_leave(group);
+    }];
+    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+
+    if (self.convertCancelRequested) {
+      [[NSFileManager defaultManager] removeItemAtURL:outURL error:nil];
+      finish([FlutterError errorWithCode:@"cancelled" message:@"conversion cancelled" details:nil]);
+      return;
+    }
+    if (writer.status == AVAssetWriterStatusFailed) {
+      finish([FlutterError errorWithCode:@"finishFailed" message:writer.error.localizedDescription details:nil]);
+      return;
+    }
+    finish(nil);
+  });
+}
+
+- (void)attachColorTagsTo:(CVPixelBufferRef)pb
+                 primaries:(HdrPrimariesMode)primaries
+                  transfer:(HdrTransferMode)transfer {
+  CFStringRef primariesTag;
+  CFStringRef matrixTag;
+  switch (primaries) {
+    case HdrPrimaries709:
+      primariesTag = kCVImageBufferColorPrimaries_ITU_R_709_2;
+      matrixTag = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
+      break;
+    case HdrPrimariesP3:
+      primariesTag = kCVImageBufferColorPrimaries_P3_D65;
+      matrixTag = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
+      break;
+    case HdrPrimaries2020:
+    default:
+      primariesTag = kCVImageBufferColorPrimaries_ITU_R_2020;
+      matrixTag = kCVImageBufferYCbCrMatrix_ITU_R_2020;
+      break;
+  }
+  CFStringRef transferTag;
+  switch (transfer) {
+    case HdrTransferSdr709: transferTag = kCVImageBufferTransferFunction_ITU_R_709_2; break;
+    case HdrTransferPq: transferTag = kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ; break;
+    case HdrTransferHlg:
+    default: transferTag = kCVImageBufferTransferFunction_ITU_R_2100_HLG; break;
+  }
+  CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, primariesTag, kCVAttachmentMode_ShouldPropagate);
+  CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, transferTag, kCVAttachmentMode_ShouldPropagate);
+  CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, matrixTag, kCVAttachmentMode_ShouldPropagate);
+}
+
+// Same as fillBgra:sdr: but reads BGRA directly from the decoded source
+// CVPixelBuffer (respecting its own stride) instead of a tightly-packed RGBA
+// buffer — no intermediate copy/byte-swizzle needed.
+// Nearest-neighbour downscale of a BGRA source into a small RGBA thumbnail
+// (long edge capped at 480px) for the live preview — see
+// latestPreviewFrame. Quality doesn't matter here, only staying cheap and
+// small: this runs once every few frames on the hot conversion loop.
+- (void)updatePreviewFromSrcBase:(const uint8_t *)srcBase srcStride:(size_t)srcStride srcW:(int)srcW srcH:(int)srcH {
+  if (srcW <= 0 || srcH <= 0) return;
+  const int maxDim = 480;
+  int longEdge = MAX(srcW, srcH);
+  float scale = longEdge > maxDim ? (float)maxDim / (float)longEdge : 1.0f;
+  int outW = MAX(1, (int)(srcW * scale));
+  int outH = MAX(1, (int)(srcH * scale));
+
+  NSMutableData *out = [NSMutableData dataWithLength:(NSUInteger)outW * outH * 4];
+  uint8_t *dst = (uint8_t *)out.mutableBytes;
+  for (int y = 0; y < outH; y++) {
+    int sy = (int)(y / scale);
+    if (sy >= srcH) sy = srcH - 1;
+    const uint8_t *srow = srcBase + (size_t)sy * srcStride;
+    uint8_t *drow = dst + (size_t)y * outW * 4;
+    for (int x = 0; x < outW; x++) {
+      int sx = (int)(x / scale);
+      if (sx >= srcW) sx = srcW - 1;
+      const uint8_t *sp = srow + (size_t)sx * 4;  // BGRA
+      uint8_t *dp = drow + (size_t)x * 4;
+      dp[0] = sp[2];  // R
+      dp[1] = sp[1];  // G
+      dp[2] = sp[0];  // B
+      dp[3] = sp[3];  // A
+    }
   }
 
-  [self attachColorTagsTo:pb];
-  CVPixelBufferLockBaseAddress(pb, 0);
-  if (self.transfer == HdrTransferSdr709) {
-    [self fillBgra:pb sdr:sdrBytes];
-  } else {
-    [self fillHalf:pb sdr:sdrBytes];
-  }
-  CVPixelBufferUnlockBaseAddress(pb, 0);
+  self.latestPreviewFrame = out;
+  self.latestPreviewWidth = outW;
+  self.latestPreviewHeight = outH;
+  self.latestPreviewGeneration += 1;
+}
 
-  while (!self.videoInput.readyForMoreMediaData) {
-    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+- (void)fillBgraDirect:(CVPixelBufferRef)pb
+                  width:(int)w
+                 height:(int)h
+                srcBase:(const uint8_t *)srcBase
+              srcStride:(size_t)srcStride
+                  readW:(int)readW
+                  readH:(int)readH {
+  uint8_t *base = CVPixelBufferGetBaseAddress(pb);
+  size_t stride = CVPixelBufferGetBytesPerRow(pb);
+  for (int y = 0; y < readH; y++) {
+    const uint8_t *src = srcBase + (size_t)y * srcStride;  // BGRA
+    uint8_t *dst = base + (size_t)y * stride;
+    for (int x = 0; x < readW; x++) {
+      dst[x * 4 + 0] = src[x * 4 + 0];
+      dst[x * 4 + 1] = src[x * 4 + 1];
+      dst[x * 4 + 2] = src[x * 4 + 2];
+      dst[x * 4 + 3] = src[x * 4 + 3];
+    }
+    if (readW < w) {
+      memset(dst + readW * 4, 0, (size_t)(w - readW) * 4);
+    }
   }
-  CMTime pts = CMTimeMake(self.frameIdx, self.fps);
-  BOOL ok = [self.adaptor appendPixelBuffer:pb withPresentationTime:pts];
-  CVPixelBufferRelease(pb);
-  if (!ok) {
-    result([FlutterError errorWithCode:@"appendFailed"
-                              message:self.writer.error.localizedDescription
-                              details:nil]);
-    return;
+  if (readH < h) {
+    memset(base + (size_t)readH * stride, 0, (size_t)(h - readH) * stride);
   }
-  self.frameIdx += 1;
-  result(nil);
+}
+
+// Same colour maths as fillHalf:sdr:, reading BGRA directly from the decoded
+// source CVPixelBuffer instead of a tightly-packed RGBA buffer.
+- (void)fillHalfDirect:(CVPixelBufferRef)pb
+                  width:(int)w
+                 height:(int)h
+               maxBoost:(float)maxBoost
+                   knee:(float)knee
+             saturation:(float)sat
+           cllLimitNits:(float)cllLimitNits
+           sdrWhiteNits:(float)sdrWhiteNits
+               transfer:(HdrTransferMode)tf
+              primaries:(HdrPrimariesMode)pm
+                srcBase:(const uint8_t *)srcBase
+              srcStride:(size_t)srcStride
+                  readW:(int)readW
+                  readH:(int)readH {
+  __fp16 *base = (__fp16 *)CVPixelBufferGetBaseAddress(pb);
+  size_t stride = CVPixelBufferGetBytesPerRow(pb);  // bytes
+
+  for (int y = 0; y < readH; y++) {
+    const uint8_t *srow = srcBase + (size_t)y * srcStride;  // BGRA
+    __fp16 *drow = (__fp16 *)((uint8_t *)base + (size_t)y * stride);
+    for (int x = 0; x < readW; x++) {
+      float sb = srow[x * 4 + 0] / 255.0f;
+      float sg = srow[x * 4 + 1] / 255.0f;
+      float sr = srow[x * 4 + 2] / 255.0f;
+      float k = glowFactorf(fminf(sr, fminf(sg, sb)), knee, maxBoost);
+      float r = srgbToLinear(sr) * k;
+      float g = srgbToLinear(sg) * k;
+      float b = srgbToLinear(sb) * k;
+
+      if (sat != 1.0f) {
+        float yy = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+        r = yy + sat * (r - yy);
+        g = yy + sat * (g - yy);
+        b = yy + sat * (b - yy);
+      }
+
+      if (pm == HdrPrimaries2020) lin709ToLin2020(&r, &g, &b);
+      else if (pm == HdrPrimariesP3) lin709ToLinP3(&r, &g, &b);
+
+      float er, eg, eb;
+      if (tf == HdrTransferPq) {
+        float pr = fminf(r * sdrWhiteNits, cllLimitNits) / 10000.0f;
+        float pg = fminf(g * sdrWhiteNits, cllLimitNits) / 10000.0f;
+        float pb2 = fminf(b * sdrWhiteNits, cllLimitNits) / 10000.0f;
+        er = pqOetf(pr); eg = pqOetf(pg); eb = pqOetf(pb2);
+      } else {  // HLG
+        float yl = 0.2627f * r + 0.6780f * g + 0.0593f * b;  // BT.2020 luma
+        float comp = powf(fmaxf(yl, 1.0e-4f), -1.0f / 3.0f);
+        if (comp > 2.5f) comp = 2.5f;
+        er = hlgOetf(r * comp * kHlgSdrWhiteScene);
+        eg = hlgOetf(g * comp * kHlgSdrWhiteScene);
+        eb = hlgOetf(b * comp * kHlgSdrWhiteScene);
+      }
+
+      drow[x * 4 + 0] = (__fp16)er;
+      drow[x * 4 + 1] = (__fp16)eg;
+      drow[x * 4 + 2] = (__fp16)eb;
+      drow[x * 4 + 3] = (__fp16)1.0f;
+    }
+    // Zero any unread tail column so a smaller-than-expected source buffer
+    // (see hdr_converter's videoReadFrame for why that can happen) leaves
+    // black rather than uninitialized memory past readW.
+    if (readW < w) {
+      memset(drow + readW * 4, 0, (size_t)(w - readW) * 4 * sizeof(__fp16));
+    }
+  }
+  if (readH < h) {
+    memset((uint8_t *)base + (size_t)readH * stride, 0, (size_t)(h - readH) * stride);
+  }
 }
 
 - (void)attachColorTagsTo:(CVPixelBufferRef)pb {

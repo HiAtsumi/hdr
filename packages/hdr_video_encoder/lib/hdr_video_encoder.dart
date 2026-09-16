@@ -173,4 +173,78 @@ class HdrVideoEncoder {
       _height = 0;
     }
   }
+
+  /// Reads, HDR-transforms and writes the whole video in one native call,
+  /// with no per-frame round trip through Dart — see the doc comment on
+  /// convertVideo: in HdrVideoEncoderPlugin.m for why (avoids an OS-level
+  /// memory kill converting 4K video on memory-constrained devices).
+  ///
+  /// iOS-only (see isConvertVideoSupported). [width]/[height]/[fps] are the
+  /// already-known values from [HdrConverter.videoOpen] on the same file.
+  /// Progress can be polled via [getConvertProgress] while this is running,
+  /// and [cancelConvertVideo] requests early stop.
+  static Future<void> convertVideo({
+    required String inputPath,
+    required String outputPath,
+    required int width,
+    required int height,
+    required int fps,
+    required int videoBitrate,
+    HdrTransfer transfer = HdrTransfer.hlg,
+    HdrPrimaries primaries = HdrPrimaries.rec2020,
+    double maxBoost = 1.0,
+    double glowKnee = 0.7,
+    double saturation = 1.0,
+    double? maxContentLightLevel,
+    double? maxFrameAverageLightLevel,
+    double sdrWhiteNits = kSdrWhiteNits,
+  }) async {
+    await _channel.invokeMethod<void>('convertVideo', <String, Object?>{
+      'inputPath': inputPath,
+      'outputPath': outputPath,
+      'width': width,
+      'height': height,
+      'fps': fps,
+      'videoBitrate': videoBitrate,
+      'transfer': transfer.name,
+      'primaries': primaries.name,
+      'maxBoost': maxBoost,
+      'glowKnee': glowKnee,
+      'saturation': saturation,
+      'maxContentLightLevel': maxContentLightLevel,
+      'maxFrameAverageLightLevel': maxFrameAverageLightLevel,
+      'sdrWhiteNits': sdrWhiteNits,
+    });
+  }
+
+  /// Progress of an in-flight [convertVideo] call.
+  static Future<({int frameIdx, int totalFrames})> getConvertProgress() async {
+    final result = await _channel.invokeMapMethod<String, Object?>('getConvertProgress');
+    return (
+      frameIdx: (result?['frameIdx'] as int?) ?? 0,
+      totalFrames: (result?['totalFrames'] as int?) ?? 0,
+    );
+  }
+
+  /// Requests that an in-flight [convertVideo] call stop early. It still
+  /// completes (with a "cancelled" error) rather than returning immediately.
+  static Future<void> cancelConvertVideo() async {
+    await _channel.invokeMethod<void>('cancelConvertVideo');
+  }
+
+  /// A small (long edge capped, see the native side) live-preview thumbnail
+  /// captured every few frames during an in-flight [convertVideo] call, or
+  /// `null` if none has been captured yet. [generation] increments each
+  /// time a new one is captured, so callers polling this can tell whether
+  /// it's worth redrawing.
+  static Future<({int generation, int width, int height, Uint8List bytes})?> getLatestPreviewFrame() async {
+    final result = await _channel.invokeMapMethod<String, Object?>('getLatestPreviewFrame');
+    if (result == null) return null;
+    return (
+      generation: result['generation'] as int,
+      width: result['width'] as int,
+      height: result['height'] as int,
+      bytes: result['bytes'] as Uint8List,
+    );
+  }
 }

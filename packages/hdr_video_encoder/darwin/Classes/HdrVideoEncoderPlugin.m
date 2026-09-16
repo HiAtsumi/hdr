@@ -110,6 +110,17 @@ typedef NS_ENUM(NSInteger, HdrPrimariesMode) { HdrPrimaries709 = 0, HdrPrimaries
 @property(nonatomic) float maxFall;  // nits, 0 == unset
 @property(nonatomic) float sdrWhiteNits;  // PQ anchor, default kSdrWhiteNits
 
+// Audio passthrough for setup:/appendFrame:/finish: (the per-frame path —
+// see convertVideo: for the equivalent on that pipeline). The source audio
+// track is copied verbatim (no decode/re-encode) on its own queue, running
+// concurrently with the Dart-driven video frame loop; finish: waits on
+// audioGroup before finalizing the writer. All nil/unused when the source
+// has no audio track (or setup: was called without inputPath).
+@property(nonatomic) AVAssetReader *audioReader;
+@property(nonatomic) AVAssetReaderTrackOutput *audioReaderOutput;
+@property(nonatomic) AVAssetWriterInput *audioInput;
+@property(nonatomic) dispatch_group_t audioGroup;
+
 // State for convertVideo: (the single-call, no-Dart-round-trip pipeline —
 // see that method for why it exists). atomic: convertFrameIdx/convertCancelRequested
 // are written from the background conversion queue and read from the main
@@ -434,7 +445,81 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
     return;
   }
   [self.writer startSessionAtSourceTime:kCMTimeZero];
+
+  NSString *inputPath = args[@"inputPath"];
+  if ([inputPath isKindOfClass:[NSString class]] && inputPath.length > 0) {
+    [self beginAudioPassthroughFromInputPath:inputPath];
+  }
+
   result(nil);
+}
+
+// Sets up self.audioReader/audioReaderOutput/audioInput and starts copying
+// the source's audio track (verbatim, no decode/re-encode) into self.writer
+// on its own serial queue via requestMediaDataWhenReadyOnQueue:, running
+// concurrently with the Dart-driven appendFrame: video loop. No-ops (leaves
+// self.audioInput nil) if the source has no audio track, or if the writer/
+// reader can't be wired up — a silent output is preferable to failing the
+// whole conversion over an audio problem.
+- (void)beginAudioPassthroughFromInputPath:(NSString *)inputPath {
+  NSURL *inURL = [NSURL fileURLWithPath:inputPath];
+  AVURLAsset *asset = [AVURLAsset URLAssetWithURL:inURL options:nil];
+  AVAssetTrack *audioTrack = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+  if (!audioTrack) return;
+
+  NSError *readerError = nil;
+  AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&readerError];
+  if (readerError || !reader) return;
+  AVAssetReaderTrackOutput *readerOutput =
+      [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:nil];
+  if (![reader canAddOutput:readerOutput]) return;
+  [reader addOutput:readerOutput];
+  if (![reader startReading]) return;
+
+  AVAssetWriterInput *audioInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio
+                                                                  outputSettings:nil];
+  audioInput.expectsMediaDataInRealTime = NO;
+  if (![self.writer canAddInput:audioInput]) {
+    [reader cancelReading];
+    return;
+  }
+  [self.writer addInput:audioInput];
+
+  self.audioReader = reader;
+  self.audioReaderOutput = readerOutput;
+  self.audioInput = audioInput;
+  self.audioGroup = dispatch_group_create();
+  dispatch_group_enter(self.audioGroup);
+
+  dispatch_queue_t audioQueue = dispatch_queue_create("hdr_video_encoder.audio", DISPATCH_QUEUE_SERIAL);
+  dispatch_group_t group = self.audioGroup;
+  __weak typeof(self) weakSelf = self;
+  __block BOOL left = NO;
+  [audioInput requestMediaDataWhenReadyOnQueue:audioQueue
+                                     usingBlock:^{
+                                       typeof(self) strongSelf = weakSelf;
+                                       while (audioInput.readyForMoreMediaData) {
+                                         CMSampleBufferRef sbuf = strongSelf ? [strongSelf.audioReaderOutput copyNextSampleBuffer] : NULL;
+                                         if (!sbuf) {
+                                           [audioInput markAsFinished];
+                                           if (!left) {
+                                             left = YES;
+                                             dispatch_group_leave(group);
+                                           }
+                                           return;
+                                         }
+                                         BOOL ok = [audioInput appendSampleBuffer:sbuf];
+                                         CFRelease(sbuf);
+                                         if (!ok) {
+                                           [audioInput markAsFinished];
+                                           if (!left) {
+                                             left = YES;
+                                             dispatch_group_leave(group);
+                                           }
+                                           return;
+                                         }
+                                       }
+                                     }];
 }
 
 - (void)appendFrame:(NSDictionary *)args result:(FlutterResult)result {
@@ -610,6 +695,24 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
       return;
     }
     [reader addOutput:readerOutput];
+
+    // Audio passthrough: added as a second reader output (must happen before
+    // startReading, below) so it's read from the same AVAssetReader as the
+    // video composition output — copied verbatim (outputSettings:nil, no
+    // decode/re-encode) into the writer on its own queue, concurrently with
+    // the video frame loop below. nil (silent output) if the source has no
+    // audio track.
+    AVAssetTrack *audioTrack = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+    AVAssetReaderTrackOutput *audioReaderOutput = nil;
+    if (audioTrack) {
+      audioReaderOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:nil];
+      if ([reader canAddOutput:audioReaderOutput]) {
+        [reader addOutput:audioReaderOutput];
+      } else {
+        audioReaderOutput = nil;
+      }
+    }
+
     if (![reader startReading]) {
       finish([FlutterError errorWithCode:@"startReading"
                                   message:reader.error.localizedDescription
@@ -722,6 +825,19 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
       return;
     }
     [writer addInput:videoInput];
+
+    AVAssetWriterInput *audioInput = nil;
+    if (audioReaderOutput) {
+      audioInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio outputSettings:nil];
+      audioInput.expectsMediaDataInRealTime = NO;
+      if (![writer canAddInput:audioInput]) {
+        audioInput = nil;
+        audioReaderOutput = nil;
+      } else {
+        [writer addInput:audioInput];
+      }
+    }
+
     if (![writer startWriting]) {
       [reader cancelReading];
       finish([FlutterError errorWithCode:@"startWriting"
@@ -730,6 +846,58 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
       return;
     }
     [writer startSessionAtSourceTime:kCMTimeZero];
+
+    // Pump audio (if any) on its own queue, concurrently with the video frame
+    // loop below — both outputs read from the same `reader`, but each output
+    // is only ever touched from one thread, which AVAssetReader supports.
+    // `stopAudio` mirrors self.convertCancelRequested/a genuine failure so the
+    // audio pump stops promptly instead of running to completion after the
+    // video side has already given up.
+    __block BOOL stopAudio = NO;
+    __block BOOL audioLeft = NO;
+    dispatch_group_t audioGroup = nil;
+    if (audioInput) {
+      audioGroup = dispatch_group_create();
+      dispatch_group_enter(audioGroup);
+      dispatch_queue_t audioQueue = dispatch_queue_create("hdr_video_encoder.audio", DISPATCH_QUEUE_SERIAL);
+      __weak typeof(self) weakSelf = self;
+      AVAssetWriterInput *audioInputRef = audioInput;
+      AVAssetReaderTrackOutput *audioReaderOutputRef = audioReaderOutput;
+      dispatch_group_t audioGroupRef = audioGroup;
+      [audioInputRef requestMediaDataWhenReadyOnQueue:audioQueue
+                                            usingBlock:^{
+                                              typeof(self) strongSelf = weakSelf;
+                                              while (audioInputRef.readyForMoreMediaData) {
+                                                if (stopAudio || strongSelf.convertCancelRequested) {
+                                                  [audioInputRef markAsFinished];
+                                                  if (!audioLeft) {
+                                                    audioLeft = YES;
+                                                    dispatch_group_leave(audioGroupRef);
+                                                  }
+                                                  return;
+                                                }
+                                                CMSampleBufferRef sbuf = [audioReaderOutputRef copyNextSampleBuffer];
+                                                if (!sbuf) {
+                                                  [audioInputRef markAsFinished];
+                                                  if (!audioLeft) {
+                                                    audioLeft = YES;
+                                                    dispatch_group_leave(audioGroupRef);
+                                                  }
+                                                  return;
+                                                }
+                                                BOOL ok = [audioInputRef appendSampleBuffer:sbuf];
+                                                CFRelease(sbuf);
+                                                if (!ok) {
+                                                  [audioInputRef markAsFinished];
+                                                  if (!audioLeft) {
+                                                    audioLeft = YES;
+                                                    dispatch_group_leave(audioGroupRef);
+                                                  }
+                                                  return;
+                                                }
+                                              }
+                                            }];
+    }
 
     // ---- Frame loop ----
     int frameIdx = 0;
@@ -822,6 +990,13 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
       }
     }
 
+    // Let the audio pump run to completion (or stop on its own via
+    // convertCancelRequested) before tearing down the shared reader — cancelling
+    // it early would truncate whatever audio hadn't been copied yet.
+    if (failed) stopAudio = YES;
+    if (audioGroup) {
+      dispatch_group_wait(audioGroup, DISPATCH_TIME_FOREVER);
+    }
     [reader cancelReading];
 
     if (failed) {
@@ -1142,6 +1317,16 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
     return;
   }
   [self.videoInput markAsFinished];
+
+  if (self.audioGroup) {
+    dispatch_group_wait(self.audioGroup, DISPATCH_TIME_FOREVER);
+  }
+  [self.audioReader cancelReading];
+  self.audioReader = nil;
+  self.audioReaderOutput = nil;
+  self.audioInput = nil;
+  self.audioGroup = nil;
+
   dispatch_group_t group = dispatch_group_create();
   dispatch_group_enter(group);
   __weak typeof(self) weakSelf = self;

@@ -106,12 +106,17 @@ class HdrVideoEncoder {
 
   /// Configures the encoder. [width]/[height] must be even. Deletes any file
   /// already at [filepath].
+  ///
+  /// [inputPath], when given, is the source file the audio track is copied
+  /// (passthrough, no re-encode) from into the output alongside the
+  /// HDR-converted video. Pass null to produce a silent (video-only) output.
   static Future<void> setup({
     required int width,
     required int height,
     required int fps,
     required int videoBitrate,
     required String filepath,
+    String? inputPath,
     HdrTransfer transfer = HdrTransfer.hlg,
     HdrPrimaries primaries = HdrPrimaries.rec2020,
     // The glow: a channel value at or above [glowKnee] (sRGB 0..1) ramps up to
@@ -142,6 +147,7 @@ class HdrVideoEncoder {
       'fps': fps,
       'videoBitrate': videoBitrate,
       'filepath': filepath,
+      'inputPath': inputPath,
       'transfer': transfer.name,
       'primaries': primaries.name,
       'maxBoost': maxBoost,

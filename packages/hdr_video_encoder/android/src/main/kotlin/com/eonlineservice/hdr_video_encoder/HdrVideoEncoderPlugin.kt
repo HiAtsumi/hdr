@@ -5,6 +5,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecInfo.CodecProfileLevel
 import android.media.MediaCodecList
+import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.os.Build
@@ -72,6 +73,14 @@ class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private var muxerStarted = false
     private var trackIndex = -1
 
+    // Source audio track, copied through to the output muxer verbatim (no
+    // decode/re-encode) once the video track's format is known — see setup()
+    // and copyAudioTrack(). Null when the source has no audio track.
+    private var audioExtractor: MediaExtractor? = null
+    private var audioSourceTrackIndex = -1
+    private var audioFormat: MediaFormat? = null
+    private var muxAudioTrackIndex = -1
+
     // Holds at most 2 in-flight frames. Each Job.Frame carries a full uncompressed
     // RGBA byte[] (~33 MB at 4K); a deeper queue just pins that much more of the
     // Java heap and OOMs (the encoder is the bottleneck, not throughput).
@@ -128,6 +137,7 @@ class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         frameIdx = 0
         val bitrate = call.argument<Int>("videoBitrate")!!
         val filepath = call.argument<String>("filepath")!!
+        val inputPath = call.argument<String>("inputPath")
         maxBoost = (call.argument<Double>("maxBoost") ?: 1.0).toFloat().coerceAtLeast(1.0f)
         glowKnee = (call.argument<Double>("glowKnee") ?: 0.7).toFloat()
         saturation = (call.argument<Double>("saturation") ?: 1.0).toFloat()
@@ -202,6 +212,35 @@ class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         muxerStarted = false
         trackIndex = -1
 
+        audioExtractor?.release()
+        audioExtractor = null
+        audioSourceTrackIndex = -1
+        audioFormat = null
+        muxAudioTrackIndex = -1
+        if (inputPath != null) {
+            try {
+                val extractor = MediaExtractor()
+                extractor.setDataSource(inputPath)
+                for (i in 0 until extractor.trackCount) {
+                    val fmt = extractor.getTrackFormat(i)
+                    val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                    if (mime.startsWith("audio/")) {
+                        extractor.selectTrack(i)
+                        audioSourceTrackIndex = i
+                        audioFormat = fmt
+                        audioExtractor = extractor
+                        break
+                    }
+                }
+                if (audioExtractor == null) extractor.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "audio passthrough setup failed, output will be silent", e)
+                audioExtractor?.release()
+                audioExtractor = null
+                audioFormat = null
+            }
+        }
+
         startWorker()
     }
 
@@ -245,16 +284,51 @@ class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 encoder = null
                 muxer?.apply { if (muxerStarted) stop(); release() }
                 muxer = null
+                audioExtractor?.release()
+                audioExtractor = null
                 future.complete(null)
             } catch (e: Exception) {
                 Log.e(TAG, "worker failed", e)
                 queue.clear()
+                audioExtractor?.release()
+                audioExtractor = null
                 future.completeExceptionally(e)
             }
         }
         t.isDaemon = true
         t.start()
         worker = t
+    }
+
+    // Copies every sample of the source audio track straight into the output
+    // muxer (no decode/re-encode — the audio itself is never touched, only
+    // remuxed alongside the HDR-converted video). Called once, synchronously
+    // on the worker thread, right after the muxer starts: audio tracks are
+    // small enough that doing the whole pass in one shot here is simpler than
+    // interleaving it with the per-frame video loop.
+    private fun copyAudioTrack() {
+        val extractor = audioExtractor ?: return
+        val mux = muxer ?: return
+        val muxTrack = muxAudioTrackIndex
+        if (muxTrack < 0) return
+        val bufferSize = audioFormat?.let {
+            if (it.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) it.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE) else null
+        } ?: (1 shl 20)
+        val buffer = java.nio.ByteBuffer.allocate(bufferSize)
+        val info = MediaCodec.BufferInfo()
+        while (true) {
+            buffer.clear()
+            val sampleSize = extractor.readSampleData(buffer, 0)
+            if (sampleSize < 0) break
+            info.offset = 0
+            info.size = sampleSize
+            info.presentationTimeUs = extractor.sampleTime
+            info.flags = extractor.sampleFlags
+            mux.writeSampleData(muxTrack, buffer, info)
+            extractor.advance()
+        }
+        extractor.release()
+        audioExtractor = null
     }
 
     private fun feed(sdr: ByteArray) {
@@ -294,8 +368,28 @@ class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 }
                 status == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     trackIndex = mux.addTrack(enc.outputFormat)
+                    val af = audioFormat
+                    if (af != null) {
+                        try {
+                            muxAudioTrackIndex = mux.addTrack(af)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "muxer rejected source audio format, output will be silent", e)
+                            audioExtractor?.release()
+                            audioExtractor = null
+                            audioFormat = null
+                        }
+                    }
                     mux.start()
                     muxerStarted = true
+                    if (audioFormat != null) {
+                        try {
+                            copyAudioTrack()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "audio passthrough failed, output will be silent", e)
+                            audioExtractor?.release()
+                            audioExtractor = null
+                        }
+                    }
                 }
                 status >= 0 -> {
                     val out = enc.getOutputBuffer(status)!!

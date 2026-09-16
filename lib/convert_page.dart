@@ -340,6 +340,7 @@ class _ConvertPageState extends State<ConvertPage> {
       } else {
         await _convertVideoFrameByFrame(
           info: info,
+          inputPath: inputPath,
           outputPath: outputPath,
           videoBitrate: _estimateVideoBitrate(info.width, info.height, info.fps),
         );
@@ -444,6 +445,7 @@ class _ConvertPageState extends State<ConvertPage> {
   // stays unconditionally on here.
   Future<void> _convertVideoFrameByFrame({
     required SdrVideoInfo info,
+    required String inputPath,
     required String outputPath,
     required int videoBitrate,
   }) async {
@@ -453,6 +455,7 @@ class _ConvertPageState extends State<ConvertPage> {
       fps: info.fps,
       videoBitrate: videoBitrate,
       filepath: outputPath,
+      inputPath: inputPath,
     );
 
     var frameIdx = 0;
@@ -650,6 +653,14 @@ class _ConvertPageState extends State<ConvertPage> {
           ),
           child: _buttonContent(Icons.add_photo_alternate_outlined, 'Select'),
         ),
+        if (_error != null) ...[
+          const SizedBox(height: 12),
+          Text(
+            _error!,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.redAccent),
+          ),
+        ],
       ],
     );
   }
@@ -732,7 +743,7 @@ class _ConvertPageState extends State<ConvertPage> {
                               ),
                             ],
                           ),
-                          if (_error != null) ...[
+                          if (_error != null && _step != _Step.pick) ...[
                             const SizedBox(height: 8),
                             Text(
                               _error!,

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
@@ -11,7 +12,10 @@ import 'convert_page.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   if (!kIsWeb && (Platform.isIOS || Platform.isAndroid)) {
-    await MobileAds.instance.initialize();
+    // Fire-and-forget: never block the first frame on the ad SDK reaching
+    // out to the network. Ad widgets/preloads tolerate initialize() still
+    // being in flight when they're first requested.
+    unawaited(MobileAds.instance.initialize());
     // Full-screen media viewer: hide the status bar and (on Android) the
     // navigation bar. immersiveSticky lets a swipe from the edge reveal
     // them briefly, then they auto-hide again.

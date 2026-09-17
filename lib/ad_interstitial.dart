@@ -4,12 +4,14 @@ import 'package:google_mobile_ads/google_mobile_ads.dart';
 
 import 'ad_banner.dart' show isAdsSupportedPlatform;
 
-// Google公式のテスト用インタースティシャル広告ユニットID。実IDが決まり次第差し替える。
+// Google公式のインタースティシャル広告ユニットID。上がテスト用で下が実ID。
 // https://developers.google.com/admob/android/test-ads
 // https://developers.google.com/admob/ios/test-ads
 String get _testInterstitialAdUnitId => Platform.isAndroid
-    ? 'ca-app-pub-3940256099942544/1033173712'
-    : 'ca-app-pub-3940256099942544/4411468910';
+    //? 'ca-app-pub-3940256099942544/1033173712'
+    ? 'ca-app-pub-3974776018579904/2278703575'
+    //: 'ca-app-pub-3940256099942544/4411468910';
+    : 'ca-app-pub-3974776018579904/5149865761';
 
 /// Loads one interstitial ad ahead of time and shows it on request.
 /// `showIfReady` never awaits ad dismissal — it fires the native overlay and

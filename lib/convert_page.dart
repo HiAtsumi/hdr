@@ -307,6 +307,7 @@ class _ConvertPageState extends State<ConvertPage> {
       _cancelRequested = false;
     });
 
+    String? outputPath;
     try {
       final info = await HdrConverter.videoOpen(inputPath);
       _previewAspectRatio = info.width / info.height;
@@ -316,7 +317,7 @@ class _ConvertPageState extends State<ConvertPage> {
 
       final dir = await getTemporaryDirectory();
       final base = p.basenameWithoutExtension(inputPath);
-      final outputPath = p.join(
+      outputPath = p.join(
         dir.path,
         '${base}_hdr_${DateTime.now().millisecondsSinceEpoch}.mp4',
       );
@@ -386,7 +387,18 @@ class _ConvertPageState extends State<ConvertPage> {
         _step = _Step.done;
       });
     } catch (e) {
+      // _convertVideoFrameByFrame already tears down the encoder/reader itself
+      // (its own try/finally) on the Android path; this covers iOS (whose
+      // convertVideo failure path releases its own native resources) and acts
+      // as a harmless no-op fallback otherwise.
       await HdrConverter.videoClose();
+      if (outputPath != null) {
+        try {
+          await File(outputPath).delete();
+        } catch (_) {
+          // Best-effort cleanup; a missing/undeletable temp file isn't fatal.
+        }
+      }
       _clearPreviewImages();
       _sourcePreview?.play();
       if (!mounted) return;
@@ -465,27 +477,34 @@ class _ConvertPageState extends State<ConvertPage> {
       inputPath: inputPath,
     );
 
-    var frameIdx = 0;
-    while (!_cancelRequested) {
-      final frame = await HdrConverter.videoReadFrame();
-      if (frame == null) break;
-      await HdrVideoEncoder.appendFrame(sdrRgba: frame);
-      frameIdx++;
-      if (info.frameCount > 0) {
-        final progress = (frameIdx / info.frameCount).clamp(0.0, 1.0);
-        if (mounted) setState(() => _progress = progress);
-      }
-      if (frameIdx % _previewFrameInterval == 0) {
-        final image = await _decodeFrame(frame, info.width, info.height);
-        if (!mounted) {
-          image.dispose();
-          break;
+    try {
+      var frameIdx = 0;
+      while (!_cancelRequested) {
+        final frame = await HdrConverter.videoReadFrame();
+        if (frame == null) break;
+        await HdrVideoEncoder.appendFrame(sdrRgba: frame);
+        frameIdx++;
+        if (info.frameCount > 0) {
+          final progress = (frameIdx / info.frameCount).clamp(0.0, 1.0);
+          if (mounted) setState(() => _progress = progress);
         }
-        _pushPreviewImage(image);
+        if (frameIdx % _previewFrameInterval == 0) {
+          final image = await _decodeFrame(frame, info.width, info.height);
+          if (!mounted) {
+            image.dispose();
+            break;
+          }
+          _pushPreviewImage(image);
+        }
       }
+    } finally {
+      // Runs on the normal/cancel exits above too, not just on error: without
+      // this in a finally, a videoReadFrame/appendFrame throw would skip
+      // finish() entirely, leaving the encoder's worker thread parked forever
+      // on its input queue with its MediaCodec/MediaMuxer never released.
+      await HdrVideoEncoder.finish();
+      await HdrConverter.videoClose();
     }
-    await HdrVideoEncoder.finish();
-    await HdrConverter.videoClose();
   }
 
   Future<ui.Image> _decodeFrame(Uint8List rgba, int width, int height) {

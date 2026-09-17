@@ -1002,6 +1002,7 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
     if (failed) {
       [videoInput markAsFinished];
       [writer cancelWriting];
+      [[NSFileManager defaultManager] removeItemAtURL:outURL error:nil];
       finish([FlutterError errorWithCode:failCode message:failMessage details:nil]);
       return;
     }
@@ -1020,6 +1021,7 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
       return;
     }
     if (writer.status == AVAssetWriterStatusFailed) {
+      [[NSFileManager defaultManager] removeItemAtURL:outURL error:nil];
       finish([FlutterError errorWithCode:@"finishFailed" message:writer.error.localizedDescription details:nil]);
       return;
     }

@@ -290,6 +290,31 @@ class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             } catch (e: Exception) {
                 Log.e(TAG, "worker failed", e)
                 queue.clear()
+                // stop()/release() themselves can throw once the codec/muxer is
+                // already in a bad state (that's how we got here) — guard each
+                // so one failure doesn't skip releasing the rest.
+                try {
+                    encoder?.stop()
+                } catch (e2: Exception) {
+                    Log.e(TAG, "encoder.stop failed during error cleanup", e2)
+                }
+                try {
+                    encoder?.release()
+                } catch (e2: Exception) {
+                    Log.e(TAG, "encoder.release failed during error cleanup", e2)
+                }
+                encoder = null
+                try {
+                    if (muxerStarted) muxer?.stop()
+                } catch (e2: Exception) {
+                    Log.e(TAG, "muxer.stop failed during error cleanup", e2)
+                }
+                try {
+                    muxer?.release()
+                } catch (e2: Exception) {
+                    Log.e(TAG, "muxer.release failed during error cleanup", e2)
+                }
+                muxer = null
                 audioExtractor?.release()
                 audioExtractor = null
                 future.completeExceptionally(e)

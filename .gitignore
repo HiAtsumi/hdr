@@ -33,6 +33,9 @@ migrate_working_dir/
 /build/
 /coverage/
 
+# Library packages don't pin dependency versions the way the app does.
+packages/*/pubspec.lock
+
 # Symbolication related
 app.*.symbols
 

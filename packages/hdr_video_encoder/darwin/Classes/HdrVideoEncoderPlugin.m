@@ -140,6 +140,10 @@ typedef NS_ENUM(NSInteger, HdrPrimariesMode) { HdrPrimaries709 = 0, HdrPrimaries
 @property(atomic) int latestPreviewWidth;
 @property(atomic) int latestPreviewHeight;
 @property(atomic) int latestPreviewGeneration;
+
+@property(nonatomic) NSString *filepath;
+
+- (void)stripDolbyVisionBoxFromFile:(NSString *)filepath;
 @end
 
 // CIE 1931 xy chromaticity of each primaries set's own R/G/B/white point (D65),
@@ -201,7 +205,174 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
   return data;
 }
 
+#pragma mark - Dolby Vision box stripping
+//
+// VideoToolbox tags every HDR (HLG/PQ) HEVC export with a Dolby Vision "dvvC"
+// configuration box inside the video sample entry, declaring the stream
+// Profile 8.4 (or equivalent) with rpu_present_flag=1 — even with
+// HDRMetadataInsertionMode = "None" above (both here and in convertVideo:),
+// which only suppresses the per-frame dynamic RPU payload, not this static
+// container-level declaration. Verified by diffing the box tree of an iOS
+// vs. an Android export of the same HLG clip in the beat project: identical
+// hvcC/colr (primaries=9, transfer=18, matrix=9), but only the iOS file
+// carries a dvvC box. YouTube's ingestion appears to treat that mismatched
+// Dolby Vision declaration (RPU claimed present, none actually authored) as
+// reason to fall back to SDR, even though every other player/SNS just
+// ignores/tolerates it and reads the plain HLG signalling fine. Strip the
+// box after writing so the file is unambiguous plain HLG/PQ HEVC, matching
+// the Android encoder's output. KEEP IN SYNC with the beat/lyrics copies of
+// this file (both pipelines here — setup:/appendFrame:/finish: AND
+// convertVideo: — call stripDolbyVisionBoxFromFile: on success).
+
+static uint32_t ReadBE32(NSData *data, NSUInteger offset) {
+  const uint8_t *p = (const uint8_t *)data.bytes + offset;
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static void WriteBE32(NSMutableData *data, NSUInteger offset, uint32_t value) {
+  uint8_t *p = (uint8_t *)data.mutableBytes + offset;
+  p[0] = (value >> 24) & 0xFF;
+  p[1] = (value >> 16) & 0xFF;
+  p[2] = (value >> 8) & 0xFF;
+  p[3] = value & 0xFF;
+}
+
+// Finds the first child box of `type` within [start, end) of `data` (32-bit
+// sizes only — moov and everything under it are small and never use a
+// 64-bit "largesize" box in AVAssetWriter's output). Returns NO if not found
+// or the box tree looks malformed, rather than reading out of bounds.
+static BOOL FindBox(NSData *data, NSUInteger start, NSUInteger end, const char *type,
+                     NSUInteger *outOffset, NSUInteger *outSize) {
+  NSUInteger offset = start;
+  while (offset + 8 <= end) {
+    uint32_t size = ReadBE32(data, offset);
+    if (size < 8 || offset + size > end) return NO;
+    if (memcmp((const uint8_t *)data.bytes + offset + 4, type, 4) == 0) {
+      *outOffset = offset;
+      *outSize = size;
+      return YES;
+    }
+    offset += size;
+  }
+  return NO;
+}
+
+// Removes [rangeStart, rangeStart+len) from `data` and subtracts `len` from
+// the 32-bit big-endian size field at the start of every box in
+// `ancestorOffsets` (each of which contains the removed range).
+static void RemoveRangeAndShrinkAncestors(NSMutableData *data, NSUInteger rangeStart,
+                                           NSUInteger len, NSArray<NSNumber *> *ancestorOffsets) {
+  [data replaceBytesInRange:NSMakeRange(rangeStart, len) withBytes:NULL length:0];
+  for (NSNumber *off in ancestorOffsets) {
+    NSUInteger o = off.unsignedIntegerValue;
+    uint32_t size = ReadBE32(data, o);
+    WriteBE32(data, o, size - (uint32_t)len);
+  }
+}
+
 @implementation HdrVideoEncoderPlugin
+
+- (void)stripDolbyVisionBoxFromFile:(NSString *)filepath {
+  if (filepath.length == 0) return;
+  @try {
+    NSFileHandle *fh = [NSFileHandle fileHandleForUpdatingAtPath:filepath];
+    if (!fh) return;
+    unsigned long long fileSize = [fh seekToEndOfFile];
+
+    // Walk top-level boxes with tiny 8/16-byte reads to locate `moov` — mdat
+    // can be hundreds of MB to several GB and must never be loaded into
+    // memory. Handles the 64-bit "largesize" box form so a large mdat is
+    // skipped correctly rather than misread as a small one.
+    unsigned long long offset = 0;
+    unsigned long long moovOffset = 0, moovSize = 0;
+    BOOL foundMoov = NO;
+    while (offset + 8 <= fileSize) {
+      [fh seekToFileOffset:offset];
+      NSData *header = [fh readDataOfLength:8];
+      if (header.length < 8) break;
+      uint32_t size32 = ReadBE32(header, 0);
+      char type[5] = {0};
+      memcpy(type, (const uint8_t *)header.bytes + 4, 4);
+      unsigned long long boxSize;
+      unsigned long long headerLen = 8;
+      if (size32 == 1) {
+        NSData *ext = [fh readDataOfLength:8];
+        if (ext.length < 8) break;
+        uint64_t hi = ReadBE32(ext, 0);
+        uint64_t lo = ReadBE32(ext, 4);
+        boxSize = (hi << 32) | lo;
+        headerLen = 16;
+      } else if (size32 == 0) {
+        boxSize = fileSize - offset;
+      } else {
+        boxSize = size32;
+      }
+      if (boxSize < headerLen) break;
+      if (strcmp(type, "moov") == 0) {
+        moovOffset = offset;
+        moovSize = boxSize;
+        foundMoov = YES;
+        break;
+      }
+      offset += boxSize;
+    }
+    if (!foundMoov || moovOffset + moovSize > fileSize) {
+      [fh closeFile];
+      return;
+    }
+
+    // Read moov plus whatever (normally empty) tail follows it, patch in
+    // memory, and rewrite just that span — mdat, which precedes moov in this
+    // writer's output, is never touched.
+    [fh seekToFileOffset:moovOffset];
+    NSMutableData *tail = [[fh readDataToEndOfFile] mutableCopy];
+    [fh closeFile];
+    if (!tail || tail.length != fileSize - moovOffset) return;
+
+    NSUInteger trakOff, trakSize, mdiaOff, mdiaSize, minfOff, minfSize, stblOff, stblSize,
+        stsdOff, stsdSize;
+    if (!FindBox(tail, 8, (NSUInteger)moovSize, "trak", &trakOff, &trakSize)) return;
+    if (!FindBox(tail, trakOff + 8, trakOff + trakSize, "mdia", &mdiaOff, &mdiaSize)) return;
+    if (!FindBox(tail, mdiaOff + 8, mdiaOff + mdiaSize, "minf", &minfOff, &minfSize)) return;
+    if (!FindBox(tail, minfOff + 8, minfOff + minfSize, "stbl", &stblOff, &stblSize)) return;
+    if (!FindBox(tail, stblOff + 8, stblOff + stblSize, "stsd", &stsdOff, &stsdSize)) return;
+
+    // stsd is a FullBox: 4-byte version/flags + 4-byte entry_count before the
+    // sample entries.
+    NSUInteger sampleEntryStart = stsdOff + 8 + 8;
+    NSUInteger entryOff = 0, entrySize = 0;
+    BOOL foundEntry =
+        FindBox(tail, sampleEntryStart, stsdOff + stsdSize, "hvc1", &entryOff, &entrySize);
+    if (!foundEntry) {
+      foundEntry = FindBox(tail, sampleEntryStart, stsdOff + stsdSize, "hev1", &entryOff, &entrySize);
+    }
+    if (!foundEntry) return;
+
+    // VisualSampleEntry: 8-byte box header + 78 fixed bytes, then child
+    // boxes (hvcC, colr, dvvC/dvcC, ...).
+    NSUInteger childStart = entryOff + 8 + 78;
+    NSUInteger dvOff = 0, dvSize = 0;
+    BOOL foundDv = FindBox(tail, childStart, entryOff + entrySize, "dvvC", &dvOff, &dvSize);
+    if (!foundDv) {
+      foundDv = FindBox(tail, childStart, entryOff + entrySize, "dvcC", &dvOff, &dvSize);
+    }
+    if (!foundDv) return;  // nothing to strip (e.g. SDR export)
+
+    NSArray<NSNumber *> *ancestors =
+        @[ @(entryOff), @(stsdOff), @(stblOff), @(minfOff), @(mdiaOff), @(trakOff), @(0) ];
+    RemoveRangeAndShrinkAncestors(tail, dvOff, dvSize, ancestors);
+
+    NSFileHandle *wfh = [NSFileHandle fileHandleForWritingAtPath:filepath];
+    if (!wfh) return;
+    [wfh seekToFileOffset:moovOffset];
+    [wfh writeData:tail];
+    unsigned long long newFileSize = moovOffset + tail.length;
+    [wfh truncateFileAtOffset:newFileSize];
+    [wfh closeFile];
+  } @catch (NSException *e) {
+    NSLog(@"[hdr_video_encoder] stripDolbyVisionBoxFromFile failed: %@", e.reason);
+  }
+}
 
 + (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar {
 #if TARGET_OS_OSX
@@ -288,6 +459,7 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
   self.frameIdx = 0;
   int bitrate = [args[@"videoBitrate"] intValue];
   NSString *filepath = args[@"filepath"];
+  self.filepath = filepath;
   NSString *transferStr = args[@"transfer"];
   NSString *primariesStr = args[@"primaries"];
   self.maxBoost = [args[@"maxBoost"] floatValue];
@@ -1025,6 +1197,7 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
       finish([FlutterError errorWithCode:@"finishFailed" message:writer.error.localizedDescription details:nil]);
       return;
     }
+    [self stripDolbyVisionBoxFromFile:outputPath];
     finish(nil);
   });
 }
@@ -1346,6 +1519,7 @@ static NSData *HdrContentLightLevelData(float maxCllNits, float maxFallNits) {
     return;
   }
   (void)weakSelf;
+  [self stripDolbyVisionBoxFromFile:self.filepath];
   result(nil);
 }
 

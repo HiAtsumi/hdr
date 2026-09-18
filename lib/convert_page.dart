@@ -429,6 +429,11 @@ class _ConvertPageState extends State<ConvertPage> {
       height: height,
       fps: fps,
       videoBitrate: videoBitrate,
+      // Device-verified in the beat project: boosts near-white pixels 1.5x
+      // above the glowKnee threshold so HDR playback doesn't read as flat/
+      // dull compared to SDR. maxBoost defaults to 1.0 (glow off).
+      maxBoost: 1.5,
+      glowKnee: 0.8,
     );
 
     var lastPreviewGeneration = -1;
@@ -475,6 +480,11 @@ class _ConvertPageState extends State<ConvertPage> {
       videoBitrate: videoBitrate,
       filepath: outputPath,
       inputPath: inputPath,
+      // Device-verified in the beat project: boosts near-white pixels 1.5x
+      // above the glowKnee threshold so HDR playback doesn't read as flat/
+      // dull compared to SDR. maxBoost defaults to 1.0 (glow off).
+      maxBoost: 1.5,
+      glowKnee: 0.8,
     );
 
     try {

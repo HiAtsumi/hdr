@@ -144,6 +144,7 @@ typedef NS_ENUM(NSInteger, HdrPrimariesMode) { HdrPrimaries709 = 0, HdrPrimaries
 @property(nonatomic) NSString *filepath;
 
 - (void)stripDolbyVisionBoxFromFile:(NSString *)filepath;
+- (void)relocateMoovBeforeMdatInFile:(NSString *)filepath;
 @end
 
 // CIE 1931 xy chromaticity of each primaries set's own R/G/B/white point (D65),
@@ -270,6 +271,86 @@ static void RemoveRangeAndShrinkAncestors(NSMutableData *data, NSUInteger rangeS
   }
 }
 
+static uint64_t ReadBE64(NSData *data, NSUInteger offset) {
+  const uint8_t *p = (const uint8_t *)data.bytes + offset;
+  uint64_t v = 0;
+  for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
+  return v;
+}
+
+static void WriteBE64(NSMutableData *data, NSUInteger offset, uint64_t value) {
+  uint8_t *p = (uint8_t *)data.mutableBytes + offset;
+  for (int i = 7; i >= 0; i--) {
+    p[i] = value & 0xFF;
+    value >>= 8;
+  }
+}
+
+// Like FindBox, but collects every matching child box's (offset, size)
+// instead of stopping at the first one — a moov can have more than one
+// `trak` (e.g. video + audio, which this project's finish:/convertVideo:
+// pipelines both can produce via audio passthrough).
+static void FindAllBoxes(NSData *data, NSUInteger start, NSUInteger end, const char *type,
+                          NSMutableArray<NSValue *> *outRanges) {
+  NSUInteger offset = start;
+  while (offset + 8 <= end) {
+    uint32_t size = ReadBE32(data, offset);
+    if (size < 8 || offset + size > end) return;
+    if (memcmp((const uint8_t *)data.bytes + offset + 4, type, 4) == 0) {
+      [outRanges addObject:[NSValue valueWithRange:NSMakeRange(offset, size)]];
+    }
+    offset += size;
+  }
+}
+
+// Adds `delta` to every chunk offset in every track's `stco`/`co64` box
+// inside `moov` (in place, `moov` starting at data offset 0). Each entry is
+// an absolute byte offset of sample data inside `mdat`; called after moov
+// is relocated to sit earlier in the file, so every one needs to point
+// `delta` bytes further in. Returns NO (leaving `moov` unmodified as far as
+// the caller can rely on) if the track structure isn't what's expected,
+// so the caller can bail rather than write a corrupt file.
+static BOOL ShiftAllChunkOffsets(NSMutableData *moov, uint32_t delta) {
+  NSMutableArray<NSValue *> *traks = [NSMutableArray array];
+  FindAllBoxes(moov, 8, moov.length, "trak", traks);
+  if (traks.count == 0) return NO;
+  for (NSValue *trakVal in traks) {
+    NSRange trakRange = trakVal.rangeValue;
+    NSUInteger mdiaOff, mdiaSize, minfOff, minfSize, stblOff, stblSize;
+    if (!FindBox(moov, trakRange.location + 8, trakRange.location + trakRange.length, "mdia",
+                 &mdiaOff, &mdiaSize)) {
+      return NO;
+    }
+    if (!FindBox(moov, mdiaOff + 8, mdiaOff + mdiaSize, "minf", &minfOff, &minfSize)) return NO;
+    if (!FindBox(moov, minfOff + 8, minfOff + minfSize, "stbl", &stblOff, &stblSize)) return NO;
+
+    NSUInteger stcoOff, stcoSize;
+    if (FindBox(moov, stblOff + 8, stblOff + stblSize, "stco", &stcoOff, &stcoSize)) {
+      NSUInteger entryCountOff = stcoOff + 12;
+      uint32_t entryCount = ReadBE32(moov, entryCountOff);
+      NSUInteger p = entryCountOff + 4;
+      if (p + (NSUInteger)entryCount * 4 > stcoOff + stcoSize) return NO;
+      for (uint32_t i = 0; i < entryCount; i++, p += 4) {
+        WriteBE32(moov, p, ReadBE32(moov, p) + delta);
+      }
+      continue;
+    }
+    NSUInteger co64Off, co64Size;
+    if (FindBox(moov, stblOff + 8, stblOff + stblSize, "co64", &co64Off, &co64Size)) {
+      NSUInteger entryCountOff = co64Off + 12;
+      uint32_t entryCount = ReadBE32(moov, entryCountOff);
+      NSUInteger p = entryCountOff + 4;
+      if (p + (NSUInteger)entryCount * 8 > co64Off + co64Size) return NO;
+      for (uint32_t i = 0; i < entryCount; i++, p += 8) {
+        WriteBE64(moov, p, ReadBE64(moov, p) + delta);
+      }
+      continue;
+    }
+    return NO;  // neither stco nor co64 — not the sample-table shape we expect, bail
+  }
+  return YES;
+}
+
 @implementation HdrVideoEncoderPlugin
 
 - (void)stripDolbyVisionBoxFromFile:(NSString *)filepath {
@@ -371,6 +452,138 @@ static void RemoveRangeAndShrinkAncestors(NSMutableData *data, NSUInteger rangeS
     [wfh closeFile];
   } @catch (NSException *e) {
     NSLog(@"[hdr_video_encoder] stripDolbyVisionBoxFromFile failed: %@", e.reason);
+  }
+}
+
+#pragma mark - moov relocation ("faststart")
+//
+// AVAssetWriter always appends `moov` after `mdat` (it can't know the final
+// sample tables until every frame has been written), giving files the shape
+// ftyp + mdat + moov. That's fine for local playback/AVFoundation, which
+// seeks freely, but some ingestion pipelines a shared file is handed to may
+// read front-to-back and finish their analysis — including whatever decides
+// HDR-ness, which lives inside `moov` — before ever reaching the tail. This
+// moves `moov` to sit right after `ftyp` and before `mdat` ("faststart"),
+// matching the shape most camera/editing pipelines already produce. Every
+// chunk offset stored in every track's `stco`/`co64` is an absolute file
+// offset into `mdat`, so each one is bumped forward by moov's size once it
+// moves earlier in the file (mdat's own bytes, and moov's own box size, are
+// untouched — only those offset integers change). Requires the file to be
+// exactly ftyp + mdat + moov with nothing after moov (AVAssetWriter's normal
+// non-fragmented output shape); bails without touching the file otherwise.
+// `mdat` (hundreds of MB to several GB) is streamed to a temp file in
+// chunks, never loaded into memory. Handles multiple tracks (this project's
+// finish:/convertVideo: can both mux in an audio track via passthrough), see
+// ShiftAllChunkOffsets. KEEP IN SYNC with the beat/lyrics/withmap projects'
+// copies of this file.
+- (void)relocateMoovBeforeMdatInFile:(NSString *)filepath {
+  if (filepath.length == 0) return;
+  NSString *tmpPath = [filepath stringByAppendingString:@".faststart.tmp"];
+  @try {
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:filepath];
+    if (!fh) return;
+    unsigned long long fileSize = [fh seekToEndOfFile];
+    [fh seekToFileOffset:0];
+
+    NSData *ftypHeader = [fh readDataOfLength:8];
+    if (ftypHeader.length < 8 || memcmp((const uint8_t *)ftypHeader.bytes + 4, "ftyp", 4) != 0) {
+      [fh closeFile];
+      return;
+    }
+    uint32_t ftypSize = ReadBE32(ftypHeader, 0);
+    if (ftypSize < 8 || ftypSize > fileSize) {
+      [fh closeFile];
+      return;
+    }
+    unsigned long long mdatOffset = ftypSize;
+
+    [fh seekToFileOffset:mdatOffset];
+    NSData *mdatHeader = [fh readDataOfLength:8];
+    if (mdatHeader.length < 8 || memcmp((const uint8_t *)mdatHeader.bytes + 4, "mdat", 4) != 0) {
+      [fh closeFile];
+      return;
+    }
+    uint32_t mdatSize32 = ReadBE32(mdatHeader, 0);
+    unsigned long long mdatSize;
+    if (mdatSize32 == 1) {
+      NSData *ext = [fh readDataOfLength:8];
+      if (ext.length < 8) {
+        [fh closeFile];
+        return;
+      }
+      mdatSize = ((uint64_t)ReadBE32(ext, 0) << 32) | ReadBE32(ext, 4);
+    } else if (mdatSize32 == 0) {
+      [fh closeFile];  // extends to EOF -> no moov after it, not our expected shape
+      return;
+    } else {
+      mdatSize = mdatSize32;
+    }
+    unsigned long long moovOffset = mdatOffset + mdatSize;
+    if (moovOffset >= fileSize) {
+      [fh closeFile];
+      return;
+    }
+
+    [fh seekToFileOffset:moovOffset];
+    NSMutableData *moov = [[fh readDataToEndOfFile] mutableCopy];
+    [fh closeFile];
+    if (!moov || moov.length != fileSize - moovOffset) return;
+    if (moov.length < 8 || ReadBE32(moov, 0) != moov.length ||
+        memcmp((const uint8_t *)moov.bytes + 4, "moov", 4) != 0) {
+      return;  // trailing content after moov, or malformed — bail, leave file untouched
+    }
+    if (moov.length > UINT32_MAX) return;  // moov is always small; refuse to touch anything this odd
+
+    if (!ShiftAllChunkOffsets(moov, (uint32_t)moov.length)) return;
+
+    [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+    if (![[NSFileManager defaultManager] createFileAtPath:tmpPath contents:nil attributes:nil]) {
+      return;
+    }
+    NSFileHandle *wfh = [NSFileHandle fileHandleForWritingAtPath:tmpPath];
+    NSFileHandle *rfh = [NSFileHandle fileHandleForReadingAtPath:filepath];
+    if (!wfh || !rfh) {
+      [wfh closeFile];
+      [rfh closeFile];
+      [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+      return;
+    }
+
+    [rfh seekToFileOffset:0];
+    [wfh writeData:[rfh readDataOfLength:(NSUInteger)ftypSize]];  // ftyp, unchanged
+    [wfh writeData:moov];                                         // moov, patched, now second
+    [rfh seekToFileOffset:mdatOffset];
+    const NSUInteger kCopyChunk = 4 * 1024 * 1024;
+    unsigned long long remaining = mdatSize;
+    while (remaining > 0) {
+      @autoreleasepool {
+        NSUInteger n = remaining < kCopyChunk ? (NSUInteger)remaining : kCopyChunk;
+        NSData *chunk = [rfh readDataOfLength:n];
+        if (chunk.length == 0) break;
+        [wfh writeData:chunk];
+        remaining -= chunk.length;
+      }
+    }
+    [rfh closeFile];
+    [wfh closeFile];
+    if (remaining != 0) {
+      [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+      return;  // short read copying mdat — leave the original file untouched
+    }
+
+    NSError *moveErr = nil;
+    if (![[NSFileManager defaultManager] replaceItemAtURL:[NSURL fileURLWithPath:filepath]
+                                              withItemAtURL:[NSURL fileURLWithPath:tmpPath]
+                                             backupItemName:nil
+                                                    options:0
+                                           resultingItemURL:nil
+                                                      error:&moveErr]) {
+      NSLog(@"[hdr_video_encoder] relocateMoovBeforeMdatInFile replace failed: %@", moveErr);
+      [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+    }
+  } @catch (NSException *e) {
+    NSLog(@"[hdr_video_encoder] relocateMoovBeforeMdatInFile failed: %@", e.reason);
+    [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
   }
 }
 
@@ -1198,6 +1411,7 @@ static void RemoveRangeAndShrinkAncestors(NSMutableData *data, NSUInteger rangeS
       return;
     }
     [self stripDolbyVisionBoxFromFile:outputPath];
+    [self relocateMoovBeforeMdatInFile:outputPath];
     finish(nil);
   });
 }
@@ -1520,6 +1734,7 @@ static void RemoveRangeAndShrinkAncestors(NSMutableData *data, NSUInteger rangeS
   }
   (void)weakSelf;
   [self stripDolbyVisionBoxFromFile:self.filepath];
+  [self relocateMoovBeforeMdatInFile:self.filepath];
   result(nil);
 }
 

@@ -170,6 +170,20 @@ class HdrVideoEncoder {
     });
   }
 
+  /// Aborts an in-progress [setup]/[appendFrame] export and releases the native
+  /// encoder (codec / muxer / writer, audio reader, worker thread, queued
+  /// frames), and deletes the partial file on iOS. Safe to call when nothing is
+  /// running. Call this instead of [finish] when the user cancels or an export
+  /// fails part-way. (For [convertVideo], use [cancelConvertVideo].)
+  static Future<void> cancel() async {
+    try {
+      await _channel.invokeMethod<void>('cancel');
+    } finally {
+      _width = 0;
+      _height = 0;
+    }
+  }
+
   /// Finalizes and closes the file.
   static Future<void> finish() async {
     try {

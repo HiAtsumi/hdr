@@ -612,6 +612,9 @@ static BOOL ShiftAllChunkOffsets(NSMutableData *moov, uint32_t delta) {
       [self appendFrame:call.arguments result:result];
     } else if ([@"finish" isEqualToString:call.method]) {
       [self finish:result];
+    } else if ([@"cancel" isEqualToString:call.method]) {
+      [self cancelEncoding];
+      result(nil);
     } else if ([@"convertVideo" isEqualToString:call.method]) {
       [self convertVideo:call.arguments result:result];
     } else if ([@"getConvertProgress" isEqualToString:call.method]) {
@@ -665,7 +668,41 @@ static BOOL ShiftAllChunkOffsets(NSMutableData *moov, uint32_t delta) {
   });
 }
 
+// Aborts an in-flight setup:/appendFrame: export: stops the audio passthrough,
+// cancels the AVAssetWriter (which also deletes its partial output), drops the
+// input/adaptor/pixel-buffer pool, and removes the partial file. No-op when
+// nothing is running. Also called at the top of setup: so an export that was
+// never finished can't leak into the next one. (convertVideo: has its own
+// cancel path — cancelConvertVideo — and tears itself down.)
+- (void)cancelEncoding {
+  AVAssetWriter *w = self.writer;
+  if (!w) return; // nothing in flight (never set up, or already finished)
+  if (w.status == AVAssetWriterStatusWriting) {
+    // Same order as finish: — end the reader and the video input first so the
+    // audio pump runs dry and calls markAsFinished on its own queue, then wait
+    // for it (bounded) before cancelling the writer.
+    [self.audioReader cancelReading];
+    [self.videoInput markAsFinished];
+    if (self.audioGroup) {
+      dispatch_group_wait(self.audioGroup, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+    }
+    [w cancelWriting];
+  }
+  [self.audioReader cancelReading];
+  self.audioReader = nil;
+  self.audioReaderOutput = nil;
+  self.audioInput = nil;
+  self.audioGroup = nil;
+  self.writer = nil;
+  self.videoInput = nil;
+  self.adaptor = nil;
+  if (self.filepath.length > 0) {
+    [[NSFileManager defaultManager] removeItemAtPath:self.filepath error:nil];
+  }
+}
+
 - (void)setup:(NSDictionary *)args result:(FlutterResult)result {
+  if (self.writer) [self cancelEncoding];
   self.width = [args[@"width"] intValue];
   self.height = [args[@"height"] intValue];
   self.fps = [args[@"fps"] intValue];

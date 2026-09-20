@@ -487,6 +487,7 @@ class _ConvertPageState extends State<ConvertPage> {
       glowKnee: 0.8,
     );
 
+    var encoderFinished = false; // finish() まで成功したか
     try {
       var frameIdx = 0;
       while (!_cancelRequested) {
@@ -507,12 +508,22 @@ class _ConvertPageState extends State<ConvertPage> {
           _pushPreviewImage(image);
         }
       }
+      if (!_cancelRequested) {
+        await HdrVideoEncoder.finish();
+        encoderFinished = true;
+      }
     } finally {
       // Runs on the normal/cancel exits above too, not just on error: without
       // this in a finally, a videoReadFrame/appendFrame throw would skip
-      // finish() entirely, leaving the encoder's worker thread parked forever
-      // on its input queue with its MediaCodec/MediaMuxer never released.
-      await HdrVideoEncoder.finish();
+      // releasing the encoder entirely, leaving its worker thread parked
+      // forever on its input queue with its MediaCodec/MediaMuxer never
+      // released. On cancel/error the output is discarded anyway, so abort
+      // with cancel() rather than finalizing a file nobody will use.
+      if (!encoderFinished) {
+        try {
+          await HdrVideoEncoder.cancel();
+        } catch (_) {}
+      }
       await HdrConverter.videoClose();
     }
   }

@@ -39,6 +39,7 @@ private enum class Primaries { REC709, P3, REC2020 }
 private sealed class Job {
     class Frame(val sdr: ByteArray) : Job()
     object Stop : Job()
+    object Abort : Job()
 }
 
 class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
@@ -95,6 +96,7 @@ class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
+        cancel() // engine going away mid-export: don't leak the codec/muxer/worker
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -104,6 +106,7 @@ class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 "setup" -> { setup(call); result.success(null) }
                 "appendFrame" -> { appendFrame(call); result.success(null) }
                 "finish" -> { finish(); result.success(null) }
+                "cancel" -> { cancel(); result.success(null) }
                 else -> result.notImplemented()
             }
         } catch (e: Exception) {
@@ -131,6 +134,7 @@ class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     private fun setup(call: MethodCall) {
+        cancel() // free anything left by an export that was never finished
         width = call.argument<Int>("width")!!
         height = call.argument<Int>("height")!!
         fps = call.argument<Int>("fps")!!
@@ -258,6 +262,43 @@ class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         workerResult?.get()
     }
 
+    // Aborts an in-flight export and releases everything it holds: the worker
+    // thread, queued RGBA frames, the MediaCodec, the MediaMuxer and the audio
+    // extractor. Safe to call when nothing is running (no-op) or after the
+    // worker already died.
+    private fun cancel() {
+        val w = worker
+        if (w != null && w.isAlive) {
+            queue.clear()
+            queue.put(Job.Abort)
+            try {
+                workerResult?.get(10, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (e: Exception) {
+                Log.w(TAG, "cancel: worker did not stop cleanly", e)
+            }
+        }
+        queue.clear()
+        releaseQuietly() // no-op if the worker already released; covers a dead worker
+        worker = null
+        workerResult = null
+    }
+
+    private fun releaseQuietly() {
+        encoder?.let {
+            try { it.stop() } catch (_: Exception) {}
+            try { it.release() } catch (_: Exception) {}
+        }
+        encoder = null
+        muxer?.let {
+            try { if (muxerStarted) it.stop() } catch (_: Exception) {}
+            try { it.release() } catch (_: Exception) {}
+        }
+        muxer = null
+        muxerStarted = false
+        try { audioExtractor?.release() } catch (_: Exception) {}
+        audioExtractor = null
+    }
+
     // ----------------------------------------------------------------------
     // Worker: feeds P010 frames into the encoder and muxes the output.
     // ----------------------------------------------------------------------
@@ -277,6 +318,11 @@ class HdrVideoEncoderPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                         is Job.Frame -> {
                             feed(job.sdr)
                             drain(bufferInfo, endOfStream = false)
+                        }
+                        is Job.Abort -> {
+                            releaseQuietly()
+                            future.complete(null)
+                            return@Thread
                         }
                     }
                 }

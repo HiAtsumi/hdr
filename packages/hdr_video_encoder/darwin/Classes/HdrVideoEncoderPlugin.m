@@ -898,8 +898,14 @@ static BOOL ShiftAllChunkOffsets(NSMutableData *moov, uint32_t delta) {
   [reader addOutput:readerOutput];
   if (![reader startReading]) return;
 
+  // Passthrough (outputSettings:nil) into an MPEG-4 file requires a source
+  // format hint — without one canAddInput: says NO and the audio is
+  // silently dropped.
+  CMFormatDescriptionRef audioFormatHint =
+      (__bridge CMFormatDescriptionRef)audioTrack.formatDescriptions.firstObject;
   AVAssetWriterInput *audioInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio
-                                                                  outputSettings:nil];
+                                                                  outputSettings:nil
+                                                                sourceFormatHint:audioFormatHint];
   audioInput.expectsMediaDataInRealTime = NO;
   if (![self.writer canAddInput:audioInput]) {
     [reader cancelReading];
@@ -1081,6 +1087,13 @@ static BOOL ShiftAllChunkOffsets(NSMutableData *moov, uint32_t delta) {
     // whole frame scaled down.
     CGRect transformedRect = CGRectApplyAffineTransform(
         CGRectMake(0, 0, track.naturalSize.width, track.naturalSize.height), transform);
+    // preferredTransform normally carries the translation that brings the
+    // rotated frame back to the origin, but not always — e.g. iOS screen
+    // recordings have a pure 90° rotation with tx = ty = 0. Applied as-is,
+    // that draws the whole frame at negative coordinates, outside the
+    // render canvas, and every output frame comes out black.
+    transform = CGAffineTransformConcat(
+        transform, CGAffineTransformMakeTranslation(-transformedRect.origin.x, -transformedRect.origin.y));
     CGSize transformedSize = CGSizeMake(fabs(transformedRect.size.width), fabs(transformedRect.size.height));
     CGAffineTransform renderTransform = transform;
     if (transformedSize.width > 0 && transformedSize.height > 0) {
@@ -1250,7 +1263,13 @@ static BOOL ShiftAllChunkOffsets(NSMutableData *moov, uint32_t delta) {
 
     AVAssetWriterInput *audioInput = nil;
     if (audioReaderOutput) {
-      audioInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio outputSettings:nil];
+      // See beginAudioPassthroughFromInputPath: — MPEG-4 passthrough needs
+      // the source format hint or the audio track is silently dropped.
+      CMFormatDescriptionRef audioFormatHint =
+          (__bridge CMFormatDescriptionRef)audioTrack.formatDescriptions.firstObject;
+      audioInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio
+                                                  outputSettings:nil
+                                                sourceFormatHint:audioFormatHint];
       audioInput.expectsMediaDataInRealTime = NO;
       if (![writer canAddInput:audioInput]) {
         audioInput = nil;
@@ -1336,6 +1355,11 @@ static BOOL ShiftAllChunkOffsets(NSMutableData *moov, uint32_t delta) {
           CFRelease(sbuf);
           continue;
         }
+        // Keep the source's own timing rather than frameIdx / fps: fps is the
+        // track's *average* rate, so for variable-frame-rate sources (e.g.
+        // iOS screen recordings) idx-based timestamps squeeze the video
+        // shorter than its audio, which then drifts out of sync.
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sbuf);
         CVPixelBufferRef dstPb = NULL;
         CVReturn cv = CVPixelBufferPoolCreatePixelBuffer(NULL, adaptor.pixelBufferPool, &dstPb);
         if (cv != kCVReturnSuccess || !dstPb) {
@@ -1398,7 +1422,6 @@ static BOOL ShiftAllChunkOffsets(NSMutableData *moov, uint32_t delta) {
         while (!videoInput.readyForMoreMediaData) {
           [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
         }
-        CMTime pts = CMTimeMake(frameIdx, fps);
         BOOL ok = [adaptor appendPixelBuffer:dstPb withPresentationTime:pts];
         CVPixelBufferRelease(dstPb);
         if (!ok) {
@@ -1412,6 +1435,12 @@ static BOOL ShiftAllChunkOffsets(NSMutableData *moov, uint32_t delta) {
       }
     }
 
+    // Mark the video input finished *before* waiting on the audio pump: the
+    // writer interleaves the two, so it won't accept audio past the last
+    // video timestamp until it knows no more video is coming — waiting first
+    // deadlocks whenever the audio track runs longer than the video.
+    [videoInput markAsFinished];
+
     // Let the audio pump run to completion (or stop on its own via
     // convertCancelRequested) before tearing down the shared reader — cancelling
     // it early would truncate whatever audio hadn't been copied yet.
@@ -1422,14 +1451,12 @@ static BOOL ShiftAllChunkOffsets(NSMutableData *moov, uint32_t delta) {
     [reader cancelReading];
 
     if (failed) {
-      [videoInput markAsFinished];
       [writer cancelWriting];
       [[NSFileManager defaultManager] removeItemAtURL:outURL error:nil];
       finish([FlutterError errorWithCode:failCode message:failMessage details:nil]);
       return;
     }
 
-    [videoInput markAsFinished];
     dispatch_group_t group = dispatch_group_create();
     dispatch_group_enter(group);
     [writer finishWritingWithCompletionHandler:^{

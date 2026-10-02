@@ -201,6 +201,14 @@ typedef NS_ENUM(NSInteger, HdrPrimariesMode) { HdrPrimaries2020 = 0, HdrPrimarie
 
   CGSize naturalSize = track.naturalSize;
   CGAffineTransform transform = track.preferredTransform;
+  // Not every file's preferredTransform includes the translation that
+  // brings the rotated frame back to the origin (iOS screen recordings have
+  // a pure rotation with tx = ty = 0) — without this the frame is drawn
+  // outside the render canvas and comes out black.
+  CGRect transformedRect =
+      CGRectApplyAffineTransform(CGRectMake(0, 0, naturalSize.width, naturalSize.height), transform);
+  transform = CGAffineTransformConcat(
+      transform, CGAffineTransformMakeTranslation(-transformedRect.origin.x, -transformedRect.origin.y));
   CGSize renderSizeF = CGSizeApplyAffineTransform(naturalSize, transform);
   int width = (int)round(fabs(renderSizeF.width));
   int height = (int)round(fabs(renderSizeF.height));

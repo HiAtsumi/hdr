@@ -15,6 +15,7 @@ import 'package:video_player/video_player.dart';
 
 import 'ad_banner.dart';
 import 'ad_interstitial.dart';
+import 'animated_background.dart';
 import 'hdr_image_view.dart';
 import 'hdr_video_player.dart';
 import 'native_view_zoom.dart';
@@ -27,6 +28,13 @@ import 'share_provider.dart';
 const List<Shadow> _overlayShadows = [
   Shadow(color: Colors.black87, blurRadius: 6, offset: Offset(0, 1)),
 ];
+
+// 最初の画面のロゴ・ボタンに使う、HDRの「光」を表すグラデーション。
+const LinearGradient _accentGradient = LinearGradient(
+  begin: Alignment.topLeft,
+  end: Alignment.bottomRight,
+  colors: [Color(0xFFFFD180), Color(0xFFFF6E9C), Color(0xFFB388FF), Color(0xFF80D8FF)],
+);
 
 enum _Kind { image, video }
 
@@ -688,16 +696,26 @@ class _ConvertPageState extends State<ConvertPage> {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        const Icon(Icons.auto_awesome, size: 56, color: Colors.white70),
-        const SizedBox(height: 12),
-        const Text('SDR → HDR', style: TextStyle(fontSize: 16, color: Colors.white70)),
-        const SizedBox(height: 20),
-        OutlinedButton(
-          onPressed: _pick,
-          style: OutlinedButton.styleFrom(
-            foregroundColor: Colors.white,
-            side: const BorderSide(color: Colors.white70),
+        ShaderMask(
+          shaderCallback: _accentGradient.createShader,
+          child: const Icon(
+            Icons.auto_awesome,
+            size: 72,
+            color: Colors.white,
+            shadows: [Shadow(color: Color(0x99E040FB), blurRadius: 24)],
           ),
+        ),
+        const SizedBox(height: 16),
+        ShaderMask(
+          shaderCallback: _accentGradient.createShader,
+          child: const Text(
+            'SDR → HDR',
+            style: TextStyle(fontSize: 34, fontWeight: FontWeight.w800, letterSpacing: 2, color: Colors.white),
+          ),
+        ),
+        const SizedBox(height: 32),
+        _GradientButton(
+          onPressed: _pick,
           child: _buttonContent(Icons.add_photo_alternate_outlined, 'Select'),
         ),
         if (_error != null) ...[
@@ -727,6 +745,21 @@ class _ConvertPageState extends State<ConvertPage> {
     );
   }
 
+  // ファイル未選択の最初の画面だけ、[child]の背後に動く背景を敷く。
+  // ステータスバー/ノッチ裏まで覆うため、SafeAreaの外側に置く。
+  Widget _withPickBackground(Widget child) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 400),
+          child: _inputPath == null ? const AnimatedHdrBackground() : const SizedBox.expand(),
+        ),
+        child,
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     // タイトル・エラー・進捗・操作ボタンはすべて画像/動画プレビューの上に
@@ -737,7 +770,7 @@ class _ConvertPageState extends State<ConvertPage> {
       body: Column(
         children: [
           Expanded(
-            child: SafeArea(
+            child: _withPickBackground(SafeArea(
               bottom: false,
               child: Stack(
                 fit: StackFit.expand,
@@ -887,10 +920,48 @@ class _ConvertPageState extends State<ConvertPage> {
                   ),
                 ],
               ),
-            ),
+            )),
           ),
           const AdBanner(),
         ],
+      ),
+    );
+  }
+}
+
+/// 最初の画面の「Select」ボタン。[_accentGradient]で塗った角丸ボタンに、
+/// 同系色の淡い光彩を付ける。
+class _GradientButton extends StatelessWidget {
+  const _GradientButton({required this.onPressed, required this.child});
+
+  final VoidCallback onPressed;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final radius = BorderRadius.circular(28);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: _accentGradient,
+        borderRadius: radius,
+        boxShadow: const [BoxShadow(color: Color(0x66FF6E9C), blurRadius: 24, spreadRadius: 1)],
+      ),
+      child: Material(
+        type: MaterialType.transparency,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: radius,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 44, vertical: 10),
+            child: DefaultTextStyle.merge(
+              style: const TextStyle(color: Color(0xFF1A1033), fontSize: 16, fontWeight: FontWeight.w700),
+              child: IconTheme.merge(
+                data: const IconThemeData(color: Color(0xFF1A1033)),
+                child: child,
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }

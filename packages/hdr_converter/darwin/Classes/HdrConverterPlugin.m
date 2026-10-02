@@ -83,12 +83,12 @@ static CGAffineTransform HdrExifOrientationTransform(CGImagePropertyOrientation 
       break;
     case kCGImagePropertyOrientationLeft:
     case kCGImagePropertyOrientationLeftMirrored:
-      transform = CGAffineTransformMakeTranslation(width, 0);
+      transform = CGAffineTransformMakeTranslation(height, 0);
       transform = CGAffineTransformRotate(transform, (CGFloat)M_PI_2);
       break;
     case kCGImagePropertyOrientationRight:
     case kCGImagePropertyOrientationRightMirrored:
-      transform = CGAffineTransformMakeTranslation(0, height);
+      transform = CGAffineTransformMakeTranslation(0, width);
       transform = CGAffineTransformRotate(transform, (CGFloat)-M_PI_2);
       break;
     case kCGImagePropertyOrientationUp:
@@ -104,7 +104,7 @@ static CGAffineTransform HdrExifOrientationTransform(CGImagePropertyOrientation 
       break;
     case kCGImagePropertyOrientationLeftMirrored:
     case kCGImagePropertyOrientationRightMirrored:
-      transform = CGAffineTransformTranslate(transform, height, 0);
+      transform = CGAffineTransformTranslate(transform, width, 0);
       transform = CGAffineTransformScale(transform, -1, 1);
       break;
     case kCGImagePropertyOrientationUp:

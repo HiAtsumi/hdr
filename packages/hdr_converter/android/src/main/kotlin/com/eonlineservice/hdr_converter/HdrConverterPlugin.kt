@@ -233,7 +233,13 @@ class HdrConverterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val path = call.argument<String>("path")!!
         var isHdr = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            val bmp = BitmapFactory.decodeFile(path)
+            // Only the presence of a gainmap matters here, which survives
+            // downsampling, so decode a small version instead of the full
+            // image.
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = probeSampleSize(path)
+            }
+            val bmp = BitmapFactory.decodeFile(path, options)
             if (bmp != null) {
                 isHdr = bmp.hasGainmap()
                 bmp.recycle()
@@ -242,6 +248,16 @@ class HdrConverterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         result.success(
             mapOf("isHdr" to isHdr, "reason" to if (isHdr) "Already an HDR (Ultra HDR) image." else null),
         )
+    }
+
+    // Largest power of two keeping the long side at least PROBE_LONG_SIDE px.
+    private fun probeSampleSize(path: String): Int {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, bounds)
+        val longSide = maxOf(bounds.outWidth, bounds.outHeight)
+        var sampleSize = 1
+        while (longSide / (sampleSize * 2) >= PROBE_LONG_SIDE) sampleSize *= 2
+        return sampleSize
     }
 
     private fun convertImage(call: MethodCall, result: MethodChannel.Result) {
@@ -349,6 +365,8 @@ class HdrConverterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     // KEEP IN SYNC with hdr_video_encoder's colour maths (glowFactor).
     private companion object {
+        const val PROBE_LONG_SIDE = 512
+
         fun smoothstep(e0: Float, e1: Float, x: Float): Float {
             if (e1 <= e0) return if (x < e0) 0f else 1f
             val t = ((x - e0) / (e1 - e0)).coerceIn(0f, 1f)

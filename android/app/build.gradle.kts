@@ -74,6 +74,10 @@ flutter {
 }
 
 dependencies {
+    // MainActivityで旧OSでもエッジ ツー エッジを有効にするWindowCompat.enableEdgeToEdge()を使うため
+    // (androidx.core 1.17.0で追加)。
+    implementation("androidx.core:core-ktx:1.17.0")
+
     // HDRプレビュー用Platform View(HdrVideoPlayerView)がExoPlayerを直接使うため明示的に依存させる。
     // video_player_androidが内部で使うバージョンに合わせている。
     implementation("androidx.media3:media3-exoplayer:1.8.0")

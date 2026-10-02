@@ -3,11 +3,18 @@ package com.eonlineservice.hdr
 import android.os.Build
 import android.os.Bundle
 import android.content.pm.ActivityInfo
+import androidx.core.view.WindowCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 
 class MainActivity : FlutterActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Android 15(SDK 35)以降はtargetSdk 35以上でエッジ ツー エッジが強制されるが、
+        // それより前のOSでも同じ表示になるよう明示的に有効化する。
+        // FlutterActivityはComponentActivityではないためenableEdgeToEdge()拡張関数は
+        // 使えず、同等のWindowCompat.enableEdgeToEdge()を使う。
+        // インセットはFlutter側(SafeArea等)で処理している。
+        WindowCompat.enableEdgeToEdge(window)
         super.onCreate(savedInstanceState)
         // HDRプレビュー用のPlatform View(SurfaceView)がHDR輝度で出力
         // できるよう、ウィンドウをHDR対応のカラーモードにしておく。

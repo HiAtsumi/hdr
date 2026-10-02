@@ -46,7 +46,10 @@ class _AdBannerState extends State<AdBanner> {
 
   void _maybeReload() {
     if (!isAdsSupportedPlatform) return;
-    final width = MediaQuery.sizeOf(context).width.truncate();
+    // build()でSafeAreaが左右(横向き時のカメラ切り欠き側など)に余白を取るため、
+    // 画面幅ではなくその余白を除いた幅でバナーを取得する。
+    final padding = MediaQuery.paddingOf(context);
+    final width = (MediaQuery.sizeOf(context).width - padding.horizontal).truncate();
     if (width == _loadedWidth) return;
     final generation = ++_requestGeneration;
 
@@ -99,11 +102,16 @@ class _AdBannerState extends State<AdBanner> {
   Widget build(BuildContext context) {
     final ad = _bannerAd;
     if (ad == null) return const SizedBox.shrink();
-    return Container(
-      width: double.infinity,
-      height: ad.size.height.toDouble(),
-      alignment: Alignment.center,
-      child: AdWidget(ad: ad),
+    // エッジ ツー エッジ表示では画面最下部がナビゲーションバーの裏になるため、
+    // バナーがジェスチャーバー/ナビゲーションボタンと重ならないよう下側インセットを空ける。
+    return SafeArea(
+      top: false,
+      child: Container(
+        width: double.infinity,
+        height: ad.size.height.toDouble(),
+        alignment: Alignment.center,
+        child: AdWidget(ad: ad),
+      ),
     );
   }
 }

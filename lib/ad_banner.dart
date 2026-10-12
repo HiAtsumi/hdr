@@ -4,6 +4,8 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 
+import 'ads_init.dart';
+
 bool get isAdsSupportedPlatform =>
     !kIsWeb && (Platform.isIOS || Platform.isAndroid);
 
@@ -68,6 +70,8 @@ class _AdBannerState extends State<AdBanner> {
   }
 
   Future<void> _loadAd(int width, int generation) async {
+    await adsReady;
+    if (!mounted || generation != _requestGeneration) return;
     final size = await AdSize.getLargeAnchoredAdaptiveBannerAdSize(width);
     if (size == null || !mounted || generation != _requestGeneration) return;
 

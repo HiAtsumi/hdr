@@ -5,17 +5,16 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:google_mobile_ads/google_mobile_ads.dart';
 
+import 'ads_init.dart';
 import 'convert_page.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   if (!kIsWeb && (Platform.isIOS || Platform.isAndroid)) {
-    // Fire-and-forget: never block the first frame on the ad SDK reaching
-    // out to the network. Ad widgets/preloads tolerate initialize() still
-    // being in flight when they're first requested.
-    unawaited(MobileAds.instance.initialize());
+    // Fire-and-forget: never block the first frame on the ATT prompt or the
+    // ad SDK reaching out to the network. Ad loads await adsReady themselves.
+    unawaited(adsReady);
     // Full-screen media viewer: hide the status bar and (on Android) the
     // navigation bar. immersiveSticky lets a swipe from the edge reveal
     // them briefly, then they auto-hide again.

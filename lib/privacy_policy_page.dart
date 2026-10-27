@@ -63,7 +63,7 @@ class PrivacyPolicyPage extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('• Device identifiers (e.g., Advertising ID / IDFA / GAID)', style: bodyStyle),
+                  Text('• Device identifiers (e.g., Advertising ID / GAID; Android only)', style: bodyStyle),
                   Text('• IP address and coarse location data', style: bodyStyle),
                   Text('• App usage data and crash diagnostic data', style: bodyStyle),
                 ],
@@ -73,10 +73,16 @@ class PrivacyPolicyPage extends StatelessWidget {
             Text('Tracking and Ad Restrictions', style: headingStyle),
             const SizedBox(height: 8),
             const Text(
-              'Users can opt out of or restrict tracking for personalized ads '
-              'at any time by changing their device settings (e.g., iOS: '
-              '"Allow Apps to Request to Track", Android: "Delete or Reset '
-              'Advertising ID").',
+              'The iOS version does not track users: it does not request '
+              'App Tracking Transparency permission, does not access the '
+              'IDFA, and shows only non-personalized ads.',
+              style: bodyStyle,
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'On Android, users can opt out of or restrict tracking for '
+              'personalized ads at any time by changing their device settings '
+              '(e.g., "Delete or Reset Advertising ID").',
               style: bodyStyle,
             ),
             const SizedBox(height: 12),

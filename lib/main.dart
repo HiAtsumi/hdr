@@ -12,8 +12,8 @@ import 'convert_page.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   if (!kIsWeb && (Platform.isIOS || Platform.isAndroid)) {
-    // Fire-and-forget: never block the first frame on the ATT prompt or the
-    // ad SDK reaching out to the network. Ad loads await adsReady themselves.
+    // Fire-and-forget: never block the first frame on the ad SDK reaching
+    // out to the network. Ad loads await adsReady themselves.
     unawaited(adsReady);
     // Full-screen media viewer: hide the status bar and (on Android) the
     // navigation bar. immersiveSticky lets a swipe from the edge reveal

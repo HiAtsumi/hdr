@@ -78,7 +78,7 @@ class _AdBannerState extends State<AdBanner> {
     final ad = BannerAd(
       adUnitId: _testBannerAdUnitId,
       size: size,
-      request: const AdRequest(),
+      request: adRequest,
       listener: BannerAdListener(
         onAdLoaded: (loadedAd) {
           if (!mounted || generation != _requestGeneration) {

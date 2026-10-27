@@ -32,7 +32,7 @@ class InterstitialAdController {
     await adsReady;
     await InterstitialAd.load(
       adUnitId: _testInterstitialAdUnitId,
-      request: const AdRequest(),
+      request: adRequest,
       adLoadCallback: InterstitialAdLoadCallback(
         onAdLoaded: (ad) {
           _loading = false;

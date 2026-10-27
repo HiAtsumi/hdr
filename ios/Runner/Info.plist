@@ -32,8 +32,6 @@
 	<string>Used to save the converted HDR photo or video to your photo library.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Access your photo library to select an SDR photo or video.</string>
-	<key>NSUserTrackingUsageDescription</key>
-	<string>Used to show more relevant ads.</string>
 	<key>SKAdNetworkItems</key>
 	<array>
 		<dict>

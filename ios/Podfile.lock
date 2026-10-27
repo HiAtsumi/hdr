@@ -1,6 +1,4 @@
 PODS:
-  - app_tracking_transparency (0.0.1):
-    - Flutter
   - audioplayers_darwin (0.0.1):
     - Flutter
     - FlutterMacOS
@@ -32,7 +30,6 @@ PODS:
     - FlutterMacOS
 
 DEPENDENCIES:
-  - app_tracking_transparency (from `.symlinks/plugins/app_tracking_transparency/ios`)
   - audioplayers_darwin (from `.symlinks/plugins/audioplayers_darwin/darwin`)
   - Flutter (from `Flutter`)
   - google_mobile_ads (from `.symlinks/plugins/google_mobile_ads/ios`)
@@ -50,8 +47,6 @@ SPEC REPOS:
     - GoogleUserMessagingPlatform
 
 EXTERNAL SOURCES:
-  app_tracking_transparency:
-    :path: ".symlinks/plugins/app_tracking_transparency/ios"
   audioplayers_darwin:
     :path: ".symlinks/plugins/audioplayers_darwin/darwin"
   Flutter:
@@ -74,7 +69,6 @@ EXTERNAL SOURCES:
     :path: ".symlinks/plugins/webview_flutter_wkwebview/darwin"
 
 SPEC CHECKSUMS:
-  app_tracking_transparency: e169b653478da7bb15a6c61209015378ca73e375
   audioplayers_darwin: f15e209a3e856d1a7edcf98dc029f484fead2242
   Flutter: 71a624a5bc0c04062bf19101d501e466baf2fb47
   Google-Mobile-Ads-SDK: 7692126a35ed859f20635af281c50a2162be8bea
